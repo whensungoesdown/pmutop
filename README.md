@@ -67,8 +67,26 @@ sudo ./rt-health -p <tid>        # 跟踪一个实时线程，同时报告降级
 | `-n count` | 采样次数，默认一直运行 |
 | `-o file.csv` | 同时输出 CSV |
 | `-t file` | 实时任务的帧遥测共享文件 |
+| `-graphic`（或 `-g`、`--graphic`） | 全屏图形界面，见下文 |
 
 建议把监测进程绑定到非实时核：`taskset -c 0 sudo ./rt-health ...`。
+
+### 图形界面（-graphic）
+
+```
+sudo taskset -c 0 ./rt-health -c 4,5 -i 500 -graphic
+```
+
+类似 htop 的全屏界面，每个被监测的核一个面板：
+
+- **标题行**：核号、状态（OK / WARN / FAIL）、频率、温度，以及每秒中断数按来源的分解（EVL 定时器、温度事件、IPI、设备）；WARN 或 FAIL 时下一行显示原因；
+- **滚动图表**：IPC、LLC 未命中/K、dTLB 未命中/K、设备中断/s、全部中断/s、Linux 视角的利用率（使用 `-t` 时还有最坏帧耗时）。每个采样一列，最新的在最右；
+- **颜色**：每一列按该采样的状态着色，绿色 OK、黄色 WARN、红色 FAIL。劣化发生时，颜色变化和引起它的指标出现在同一位置；
+- **刻度固定**：同样高度的柱子始终代表同样的值，不随数据自动缩放；MPKI 和中断图表为对数刻度；
+- **事件栏**：状态变化的时间和原因，最新的在上；
+- **按键**：`q` 退出，`p` 暂停刷新（采样和基线学习继续），`c` 清空事件栏。
+
+终端行数不够时，每个核显示的图表会按重要性减少。需要 UTF-8 终端。`-o` 可以同时使用，CSV 照常写入。
 
 ### 输出列
 
@@ -177,8 +195,10 @@ src/telemetry.c/.h  帧遥测的只读映射
 telemetry/rt_frames.h  实时任务端的发布接口（头文件，无依赖）
 scripts/mock_rt.c 模拟实时任务
 scripts/selftest.sh  冒烟测试（无需 root、无需 PMU）
-scripts/ontarget/ 实机测试脚本：regress.sh（误报与中断注入）、cache-phases.sh（缓存劣化）、overhead.sh（监测开销）
+scripts/ontarget/ 实机测试脚本：regress.sh（误报与中断注入）、cache-phases.sh（缓存劣化）、overhead.sh（监测开销）、graphic-demo.sh（图形界面演示）
 tests/test_irq.c  中断分类单元测试（make check）
 tests/phases.c    缓存行为分阶段变化的负载
+tests/ptyshot.py  在伪终端中运行 -graphic 并保存最后一屏（无人值守测试用）
+src/ui.c/.h       -graphic 全屏界面（ANSI 转义序列，不依赖 curses）
 tools/irqcheck.py 列出一段时间内落到指定核上的中断
 ```

@@ -23,6 +23,7 @@
 #include "rt-health.h"
 #include "metrics.h"
 #include "telemetry.h"
+#include "ui.h"
 
 struct opt {
 	int	interval_ms;
@@ -30,6 +31,7 @@ struct opt {
 	const char *csv;
 	const char *telem;
 	pid_t	pid;			/* >0: follow this thread, not a core */
+	bool	graphic;		/* full-screen chart view */
 	int	cpus[MAX_CPUS];
 	int	nr_cpus;
 	bool	all_cpus;
@@ -179,9 +181,16 @@ int main(int argc, char **argv)
 	char err[256];
 	const char *cpus_arg = NULL;
 	int i, c, iter, ret;
+	static const struct option lopts[] = {
+		{ "graphic", no_argument, NULL, 'g' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 },
+	};
 
-	while ((c = getopt(argc, argv, "c:i:n:o:p:t:vh")) != -1) {
+	/* _only: "-graphic" works as well as "--graphic" and "-g" */
+	while ((c = getopt_long_only(argc, argv, "c:gi:n:o:p:t:vh", lopts, NULL)) != -1) {
 		switch (c) {
+		case 'g': o.graphic = true; break;
 		case 'c': cpus_arg = optarg; break;
 		case 'i': o.interval_ms = atoi(optarg); break;
 		case 'n': o.count = atoi(optarg); break;
@@ -193,7 +202,9 @@ int main(int argc, char **argv)
 		default:
 			fprintf(stderr,
 				"usage: rt-health [-c 4,5|all | -p tid] [-i ms] [-n count]"
-				" [-o out.csv] [-t telemetry.bin]\n"
+				" [-o out.csv] [-t telemetry.bin] [-graphic]\n"
+				"  -graphic  full-screen charts"
+				" (keys: q quit, p pause, c clear events)\n"
 				"  Default CPU list: /sys/devices/system/cpu/isolated.\n"
 				"  CPU-wide counters need root and a working PMU;\n"
 				"  without them the /proc and sysfs signals remain.\n");
@@ -285,8 +296,33 @@ int main(int argc, char **argv)
 			     "irq_ipi,irq_device,freq_mhz,temp_c\n");
 	}
 
+	if (o.graphic) {
+		static char mode[48];
+		struct ui_info ui = {
+			.interval_ms = o.interval_ms,
+			.mode = mode,
+			.csv = o.csv,
+			.telemetry = tel.page != NULL,
+		};
+
+		if (o.pid > 0)
+			snprintf(mode, sizeof(mode), "thread %d", (int)o.pid);
+		else
+			snprintf(mode, sizeof(mode), "%d core(s)", o.nr_cpus);
+		if (ui_start(&ui) < 0) {
+			fprintf(stderr, "-graphic needs a terminal\n");
+			return 2;
+		}
+		for (i = 0; i < o.nr_cpus; i++)
+			if (!cs[i].perf_ok)
+				ui_event("cpu%d: no PMU counters, cache/TLB/IPC charts empty",
+					 cs[i].cpu);
+		ui_draw(o.nr_cpus);
+	}
+
 	prev_ns = now_ns();
-	print_header();
+	if (!o.graphic)
+		print_header();
 
 	for (iter = 0; !stop && (o.count == 0 || iter < o.count); iter++) {
 		struct timespec ts = {
@@ -295,7 +331,12 @@ int main(int argc, char **argv)
 		};
 		double dt_s;
 
-		nanosleep(&ts, NULL);
+		if (o.graphic) {
+			if (ui_wait(o.interval_ms, o.nr_cpus))
+				break;
+		} else {
+			nanosleep(&ts, NULL);
+		}
 		now = now_ns();
 		dt_s = (double)(now - prev_ns) / 1e9;
 		prev_ns = now;
@@ -361,7 +402,10 @@ int main(int argc, char **argv)
 			}
 
 			metrics_feed(&met[i], &cs[i], dt_s, ld, note);
-			print_row(&cs[i], &met[i]);
+			if (o.graphic)
+				ui_push(i, &cs[i], &met[i], dt_s, worst / 1000.0);
+			else
+				print_row(&cs[i], &met[i]);
 
 			if (csv)
 				fprintf(csv, "%.3f,%d,%s,%.4f,%.3f,%.3f,%.3f,%.3f,"
@@ -378,10 +422,16 @@ int main(int argc, char **argv)
 					met[i].freq_mhz, met[i].temp_c);
 		}
 
-		fflush(stdout);
+		if (o.graphic && !ui_paused())
+			ui_draw(o.nr_cpus);
+		else if (!o.graphic)
+			fflush(stdout);
 		if (csv)
 			fflush(csv);
 	}
+
+	if (o.graphic)
+		ui_stop();
 
 	for (i = 0; i < o.nr_cpus; i++)
 		if (cs[i].perf_ok)
