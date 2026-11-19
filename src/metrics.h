@@ -32,6 +32,7 @@ struct metrics {
 
 	/* instantaneous */
 	double		util;
+	double		busy;
 	double		ipc;
 	double		llc_mpki;
 	double		tlb_mpki;

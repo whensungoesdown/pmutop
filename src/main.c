@@ -38,6 +38,7 @@ struct opt {
 };
 
 static volatile sig_atomic_t stop;
+static double ref_hz;		/* reference-cycle rate, 0 if unknown */
 
 static void on_signal(int sig)
 {
@@ -98,6 +99,14 @@ static void derive(struct cpu_sample *s, const uint64_t cur[8],
 		d_total += cur[i] - prev[i];
 	s->util = d_total ? 1.0 - (double)d_idle / (double)d_total : 0.0;
 
+	if (ref_hz > 0 && dt_s > 0 && s->ev_ok[EV_REF_CYCLES]) {
+		s->busy = (double)s->ev[EV_REF_CYCLES] / (ref_hz * dt_s);
+		if (s->busy > 1.0)
+			s->busy = 1.0;
+	} else {
+		s->busy = NAN;
+	}
+
 	if (s->ev_ok[EV_CYCLES] && s->ev_ok[EV_INSTRUCTIONS] && s->ev[EV_CYCLES] > 0)
 		s->ipc = (double)s->ev[EV_INSTRUCTIONS] / (double)s->ev[EV_CYCLES];
 	else
@@ -138,8 +147,8 @@ static const char *health_str(enum cpu_health h)
 
 static void print_header(void)
 {
-	printf("%-4s %-5s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
-	       "cpu", "state", "util%", "freqMHz", "IPC", "LLC/K", "dTLB/K",
+	printf("%-4s %-5s %6s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
+	       "cpu", "state", "busy%", "util%", "freqMHz", "IPC", "LLC/K", "dTLB/K",
 	       "cache/K", "stall%", "IRQ/s", "temp", "note");
 }
 
@@ -153,7 +162,7 @@ static void fmt_or_dash(char *b, size_t n, double v, const char *fmt)
 
 static void print_row(const struct cpu_sample *s, const struct metrics *m)
 {
-	char llc[16], tlb[16], cach[16], ipc[16], stall[16], tmp[16];
+	char llc[16], tlb[16], cach[16], ipc[16], stall[16], tmp[16], busy[16];
 
 	fmt_or_dash(llc, sizeof(llc), s->llc_mpki, "%.2f");
 	fmt_or_dash(tlb, sizeof(tlb), s->tlb_mpki, "%.2f");
@@ -161,9 +170,10 @@ static void print_row(const struct cpu_sample *s, const struct metrics *m)
 	fmt_or_dash(ipc, sizeof(ipc), s->ipc, "%.2f");
 	fmt_or_dash(stall, sizeof(stall), s->stall_pct, "%.1f");
 	fmt_or_dash(tmp, sizeof(tmp), m->temp_c, "%.1f");
+	fmt_or_dash(busy, sizeof(busy), m->busy * 100.0, "%.1f");
 
-	printf("%-4d %-5s %6.1f %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
-	       s->cpu, health_str(m->health), m->util * 100.0, m->freq_mhz,
+	printf("%-4d %-5s %6s %6.1f %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
+	       s->cpu, health_str(m->health), busy, m->util * 100.0, m->freq_mhz,
 	       ipc, llc, tlb, cach, stall,
 	       (unsigned long long)s->irq_rate, tmp, m->why);
 }
@@ -249,6 +259,11 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* Calibrate before anything else runs on this CPU. */
+	ref_hz = perf_ref_hz();
+	if (ref_hz <= 0)
+		fprintf(stderr, "no ref-cycles counter: busy%% unavailable\n");
+
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
@@ -293,7 +308,7 @@ int main(int argc, char **argv)
 		}
 		fprintf(csv, "t_s,cpu,state,util,ipc,llc_mpki,dtlb_mpki,"
 			     "cache_mpki,stall_pct,irq_rate,irq_timer,irq_thermal,"
-			     "irq_ipi,irq_device,freq_mhz,temp_c\n");
+			     "irq_ipi,irq_device,freq_mhz,temp_c,busy\n");
 	}
 
 	if (o.graphic) {
@@ -409,7 +424,7 @@ int main(int argc, char **argv)
 
 			if (csv)
 				fprintf(csv, "%.3f,%d,%s,%.4f,%.3f,%.3f,%.3f,%.3f,"
-					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f\n",
+					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f\n",
 					now / 1e9, cs[i].cpu,
 					health_str(met[i].health), met[i].util,
 					met[i].ipc, met[i].llc_mpki, met[i].tlb_mpki,
@@ -419,7 +434,7 @@ int main(int argc, char **argv)
 					(unsigned long long)cs[i].irq_thermal,
 					(unsigned long long)cs[i].irq_ipi,
 					(unsigned long long)cs[i].irq_device,
-					met[i].freq_mhz, met[i].temp_c);
+					met[i].freq_mhz, met[i].temp_c, met[i].busy);
 		}
 
 		if (o.graphic && !ui_paused())

@@ -110,6 +110,7 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 		return;
 
 	m->util = s->util;
+	m->busy = s->busy;
 	m->ipc = s->ipc;
 	m->llc_mpki = s->llc_mpki;
 	m->tlb_mpki = s->tlb_mpki;
@@ -126,7 +127,13 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 	 * poison it and fire an alarm the moment real work starts, so a
 	 * sample only enters the baseline once the core is actually busy.
 	 */
-	busy = s->util > 0.03;
+	/*
+	 * Linux's utilisation is ~0 on a core running EVL threads (it does
+	 * not see out-of-band execution), so prefer the hardware figure.
+	 * Measured on the ThinkBook: idle cores 0.6-0.7 % busy, a core
+	 * running one evl-pingpong thread 2-3 %; 1.5 % separates them.
+	 */
+	busy = isfinite(s->busy) ? s->busy > 0.015 : s->util > 0.03;
 
 	v[M_LLC_MPKI] = s->llc_mpki;
 	v[M_TLB_MPKI] = s->tlb_mpki;

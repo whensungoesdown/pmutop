@@ -46,7 +46,8 @@ struct cpu_sample {
 	double		temp_c;		/* NAN when unknown */
 
 	/* derived ratios */
-	double		util;		/* 0..1 */
+	double		util;		/* 0..1, Linux's view (/proc/stat) */
+	double		busy;		/* 0..1, from ref-cycles: includes EVL; NAN if unknown */
 	double		ipc;
 	double		llc_mpki;
 	double		tlb_mpki;

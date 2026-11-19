@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -65,6 +66,8 @@ static const struct ev_desc ev_tab[] = {
 	[EV_STALL_MEM]	 = { PERF_TYPE_HARDWARE,
 			     PERF_COUNT_HW_STALLED_CYCLES_BACKEND,
 			     "stalled-cycles-backend" },
+	[EV_REF_CYCLES]	 = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES,
+			     "ref-cycles" },
 	[EV_TASK_CLOCK]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK,
 			     "task-clock" },
 	[EV_CTX_SWITCH]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES,
@@ -74,6 +77,45 @@ static const struct ev_desc ev_tab[] = {
 	[EV_CPU_MIGRATE] = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_MIGRATIONS,
 			     "cpu-migrations" },
 };
+
+/*
+ * Rate of the reference-cycle counter (on x86 the TSC rate), measured by
+ * counting this thread's own reference cycles over a short busy spin.
+ * Busy fraction of a core = reference cycles counted while it is not
+ * idle / (rate x interval).  Unlike /proc/stat this includes time spent
+ * running out-of-band EVL threads, which Linux's accounting never sees.
+ * Returns 0 when the counter is not available.
+ */
+double perf_ref_hz(void)
+{
+	struct perf_event_attr attr;
+	struct timespec a, b;
+	uint64_t count = 0;
+	double dt;
+	int fd;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.type = PERF_TYPE_HARDWARE;
+	attr.size = sizeof(attr);
+	attr.config = PERF_COUNT_HW_REF_CPU_CYCLES;
+	attr.disabled = 1;
+	attr.exclude_kernel = 1;
+	attr.exclude_hv = 1;
+	fd = perf_event_open(&attr, 0, -1, -1, 0);
+	if (fd < 0)
+		return 0;
+	ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	do {
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		dt = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+	} while (dt < 0.2);
+	ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+	if (read(fd, &count, sizeof(count)) != sizeof(count))
+		count = 0;
+	close(fd);
+	return count ? (double)count / dt : 0;
+}
 
 const char *perf_event_name(int ev)
 {
