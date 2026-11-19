@@ -4,7 +4,9 @@ PP=/home/test/evl-pingpong/evl-pingpong
 cd /tmp
 echo "===== 1: pingpong 60 s + stress on non-RT cores, no injection (expect no WARN)"
 taskset -c 0 "$RH" -c 4,5 -i 1000 -o /tmp/r1.csv > /tmp/r1.txt 2>&1 & M=$!
-taskset -c 1-3,7-13 stress-ng --cache 10 --vm 4 --vm-bytes 2G -t 70 >/dev/null 2>&1 & S=$!
+# --cache-no-affinity: the cache stressor otherwise hops onto every CPU,
+# isolated ones included, whatever taskset says.
+taskset -c 1-3,7-13 stress-ng --cache 10 --cache-no-affinity --vm 4 --vm-bytes 2G -t 70 >/dev/null 2>&1 & S=$!
 sleep 3
 $PP -a 4 -b 5 -d 60 -q -S /tmp/r1.md > /dev/null 2>&1
 kill $S $M 2>/dev/null; wait 2>/dev/null

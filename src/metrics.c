@@ -113,11 +113,12 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 	m->busy = s->busy;
 	m->ipc = s->ipc;
 	m->llc_mpki = s->llc_mpki;
+	m->l2_mpki = s->l2_mpki;
 	m->tlb_mpki = s->tlb_mpki;
 	m->cache_mpki = s->cache_mpki;
 	m->stall_pct = s->stall_pct;
 	m->irq_rate = (double)s->irq_rate;
-	m->freq_mhz = s->freq_khz / 1000.0;
+	m->freq_mhz = isfinite(s->eff_mhz) ? s->eff_mhz : s->freq_khz / 1000.0;
 	m->temp_c = s->temp_c;
 
 	/*
@@ -158,7 +159,13 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 	m->z_irq = zscore(&b[M_IRQ_RATE], v[M_IRQ_RATE], &m->med_irq);
 	m->z_stall = zscore(&b[M_STALL], v[M_STALL], &m->med_stall);
 
-	m->samples++;
+	/*
+	 * Warm-up counts busy samples only: the baseline is built from busy
+	 * samples, so 30 idle ones followed by a short start-up burst must
+	 * not open the statistical checks on a baseline of a few samples.
+	 */
+	if (busy)
+		m->samples++;
 	if (m->samples > 30 && m->phase == PH_WARMUP)
 		m->phase = PH_LEARNING;
 	if (m->samples > BASE_WINDOW)
@@ -187,7 +194,7 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 	 * how EVL keeps time.  Thermal events cannot be moved and are only
 	 * reported when they are clearly unusual.
 	 */
-	if (s->irq_device > 0 && dt_s > 0) {
+	if (m->rt_core && s->irq_device > 0 && dt_s > 0) {
 		m->health = CPU_DEGRADED;
 		snprintf(m->why, sizeof(m->why),
 			 "device IRQ on an RT core: %.0f/s, busiest %s",
@@ -195,7 +202,7 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 			 s->irq_dev_top[0] ? s->irq_dev_top : "unknown");
 		return;
 	}
-	if (dt_s > 0 && (double)s->irq_ipi / dt_s > 5000) {
+	if (m->rt_core && dt_s > 0 && (double)s->irq_ipi / dt_s > 5000) {
 		m->health = CPU_DEGRADED;
 		snprintf(m->why, sizeof(m->why), "IPI storm on an RT core: %.0f/s",
 			 (double)s->irq_ipi / dt_s);

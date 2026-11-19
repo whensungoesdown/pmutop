@@ -43,8 +43,8 @@
 
 enum {
 	G_BUSY = 0,
-	G_IPC,
-	G_LLC,
+	G_PF,
+	G_L2,
 	G_TLB,
 	G_DEV,
 	G_IRQ,
@@ -59,26 +59,58 @@ struct graph_desc {
 	bool		log;		/* log10 scale */
 	double		lo, hi;		/* fixed range: comparable over time */
 	const char	*fmt;
+	/*
+	 * Colour bands of the value itself: past @warn yellow, past @bad
+	 * red.  For a higher-is-better metric (IPC) "past" means below.
+	 */
+	double		warn, bad;
+	/*
+	 * Range ladder for automatic scaling (0 = fixed range @hi).  Each
+	 * sample is drawn on the smallest rung covering the recent samples,
+	 * and its bar is coloured by that rung: the same bar height on a
+	 * higher rung means a larger value.
+	 */
+	double		rung[4];
 };
 
 /*
  * Fixed ranges, so a bar of a given height always means the same value;
  * an auto-scaled chart would magnify noise on a quiet core.
  */
+/*
+ * Every rate is per second on a linear scale.  Ranges and bands come from
+ * the ThinkBook measurements; a value past the range is drawn as a full
+ * bar with '+' at its end.
+ */
 static const struct graph_desc gd[G_NR] = {
-	[G_BUSY]  = { "CPU busy %",    false, true,  false, 0,     100,    "%.1f" },
-	[G_IPC]   = { "IPC",           false, false, false, 0,     4,      "%.2f" },
-	[G_LLC]   = { "LLC miss/K",    true,  false, true,  0.001, 100,    "%.3f" },
-	[G_TLB]   = { "dTLB miss/K",   true,  false, true,  0.001, 100,    "%.3f" },
-	[G_DEV]   = { "device IRQ/s",  true,  false, true,  1,     10000,  "%.0f" },
+	/*                  name               down   neutr  log    lo  hi       fmt     warn   bad */
+	[G_BUSY]  = { "CPU usage %",      false, true,  false, 0,  100,     "%.1f", 70,    90 },
+	/*
+	 * A page fault in an EVL thread demotes it to Linux, so on an RT
+	 * core any fault is suspect; a running pingpong core takes none.
+	 */
+	[G_PF]    = { "page fault/s",    true,  false, false, 0,  200,     NULL,   0.5,   100, { 200, 2000, 20000, 200000 } },
+	/*
+	 * L2 is private to each P-core (3 MiB), so its misses come from the
+	 * core's own working set, unlike the shared L3.  evl-pingpong: about
+	 * 30k/s; a cache-hostile task: millions per second.
+	 */
+	[G_L2]    = { "L2 miss/s",       true,  false, false, 0,  100000,  NULL,   50000, 100000, { 10000, 100000, 1000000, 20000000 } },
+	/* evl-pingpong: tens per second; a TLB-hostile task: millions */
+	[G_TLB]   = { "dTLB miss/s",     true,  false, false, 0,  10000,   NULL,   1000,  5000, { 1000, 10000, 1000000, 20000000 } },
+	/* any device interrupt on an RT core is a placement error */
+	[G_DEV]   = { "device IRQ/s",    true,  false, false, 0,  200,     NULL,   0.5,   100, { 200, 2000, 20000, 200000 } },
 	/* thermal + IPI + device: everything except EVL's own timer */
-	[G_IRQ]   = { "non-timer IRQ/s", true, false, true, 1,     100000, "%.0f" },
-	[G_FRAME] = { "worst frame us", true, false, false, 0,     1000,   "%.1f" },
+	[G_IRQ]   = { "non-timer IRQ/s", true,  false, false, 0,  5000,    NULL,   1000,  4000, { 5000, 20000, 100000, 1000000 } },
+	/* against a 1 ms period */
+	[G_FRAME] = { "worst frame us",  true,  false, false, 0,  1000,    "%.1f", 500,   900 },
 };
+
 
 struct slot_hist {
 	double		v[G_NR][HIST];
 	unsigned char	st[HIST];
+	unsigned char	rung[G_NR][HIST];	/* range rung each sample was drawn on */
 	unsigned	n;		/* samples pushed so far */
 	int		cpu;
 	enum cpu_health	last_state;
@@ -113,7 +145,21 @@ static void on_winch(int sig)
 
 /* ------------------------------------------------------------ cell grid */
 
-enum { C_DEF = 0, C_GREEN, C_YELLOW, C_RED, C_DIM, C_CYAN };
+enum { C_DEF = 0, C_GREEN, C_YELLOW, C_RED, C_DIM, C_CYAN, C_BLUE, C_MAGENTA };
+
+/* Green / yellow / red for a value, from its metric's bands. */
+static unsigned char level_col(const struct graph_desc *d, double v)
+{
+	bool up = !d->down && !d->neutral;	/* higher is better */
+
+	if (!isfinite(v))
+		return C_DIM;
+	if (up ? v < d->bad : v > d->bad)
+		return C_RED;
+	if (up ? v < d->warn : v > d->warn)
+		return C_YELLOW;
+	return C_GREEN;
+}
 
 #define A_BOLD	0x10
 #define A_REV	0x20
@@ -236,7 +282,8 @@ static void emit_attr(unsigned char a)
 {
 	static const char *const fg[] = {
 		[C_DEF] = "", [C_GREEN] = ";32", [C_YELLOW] = ";33",
-		[C_RED] = ";31", [C_DIM] = ";2", [C_CYAN] = ";36",
+		[C_RED] = ";31", [C_DIM] = ";2", [C_CYAN] = ";96",
+		[C_BLUE] = ";94", [C_MAGENTA] = ";95",
 	};
 	char buf[32];
 
@@ -358,6 +405,34 @@ void ui_event(const char *fmt, ...)
 	nevents++;
 }
 
+#define RUNG_WINDOW	10	/* samples a range must cover before stepping down */
+
+static const unsigned char rung_col[4] = { C_GREEN, C_CYAN, C_BLUE, C_MAGENTA };
+
+/*
+ * Smallest rung covering the last RUNG_WINDOW samples (this one included):
+ * the range steps up at once and back down only after a quiet stretch,
+ * so it does not flap.
+ */
+static unsigned char pick_rung(const struct slot_hist *h, int g, unsigned i)
+{
+	const struct graph_desc *d = &gd[g];
+	double mx = 0;
+	unsigned k, r;
+
+	if (d->rung[0] <= 0)
+		return 0;
+	for (k = 0; k < RUNG_WINDOW && k <= h->n; k++) {
+		double v = h->v[g][(i + HIST - k) % HIST];
+
+		if (isfinite(v) && v > mx)
+			mx = v;
+	}
+	for (r = 0; r < 3 && mx > d->rung[r]; r++)
+		;
+	return (unsigned char)r;
+}
+
 /* Length of the reason up to its first number: "LLC MPKI ", "device IRQ ..." */
 static size_t reason_kind(const char *why)
 {
@@ -377,15 +452,20 @@ void ui_push(int slot, const struct cpu_sample *s, const struct metrics *m,
 	if (h->n == 0)
 		h->last_state = CPU_OK;
 	h->cpu = s->cpu;
-	h->v[G_BUSY][i] = m->busy * 100.0;
-	h->v[G_IPC][i] = m->ipc;
-	h->v[G_LLC][i] = m->llc_mpki;
-	h->v[G_TLB][i] = m->tlb_mpki;
+	h->v[G_BUSY][i] = (isfinite(m->busy) ? m->busy : m->util) * 100.0;
+	h->v[G_PF][i] = s->ev_ok[EV_PAGE_FAULT] && dt > 0 ?
+			s->ev[EV_PAGE_FAULT] / dt : NAN;
+	h->v[G_L2][i] = s->ev_ok[EV_L2_MISSES] && dt > 0 ?
+			s->ev[EV_L2_MISSES] / dt : NAN;
+	h->v[G_TLB][i] = s->ev_ok[EV_DTLB_MISSES] && dt > 0 ?
+			 s->ev[EV_DTLB_MISSES] / dt : NAN;
 	h->v[G_DEV][i] = dt > 0 ? s->irq_device / dt : NAN;
 	h->v[G_IRQ][i] = dt > 0 ? (s->irq_thermal + s->irq_ipi + s->irq_device) / dt
 				: NAN;
 	h->v[G_FRAME][i] = worst_frame_us > 0 ? worst_frame_us : NAN;
 	h->st[i] = (unsigned char)m->health;
+	for (int g = 0; g < G_NR; g++)
+		h->rung[g][i] = pick_rung(h, g, i);
 	h->s = *s;
 	h->m = *m;
 	h->dt = dt;
@@ -430,10 +510,22 @@ static double frac(const struct graph_desc *g, double v)
 	return f < 0 ? 0 : f > 1 ? 1 : f;
 }
 
+static void human(char *b, size_t n, double v)
+{
+	if (v >= 1e6)
+		snprintf(b, n, "%.2fM", v / 1e6);
+	else if (v >= 1e4)
+		snprintf(b, n, "%.1fk", v / 1e3);
+	else
+		snprintf(b, n, "%.0f", v);
+}
+
 static void axis_label(char *b, size_t n, double v)
 {
-	if (v >= 1000)
-		snprintf(b, n, "%.0fk", v / 1000);
+	if (v >= 1e6)
+		snprintf(b, n, "%gM", v / 1e6);
+	else if (v >= 1000)
+		snprintf(b, n, "%gk", v / 1000);
 	else
 		snprintf(b, n, "%g", v);
 }
@@ -445,49 +537,92 @@ static void axis_label(char *b, size_t n, double v)
 static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, int ht)
 {
 	const struct graph_desc *d = &gd[g];
+	bool laddered = d->rung[0] > 0;
+	/* red alarm only where a high value is a fault: isolated cores */
+	bool alarm = h->m.rt_core || g == G_BUSY;
 	unsigned n = h->n < HIST ? h->n : HIST;
 	int pw = w - AXIS_W;			/* plot width */
 	unsigned shown = n < (unsigned)pw ? n : (unsigned)pw;
-	double cur = h->n ? h->v[g][(h->n - 1) % HIST] : NAN;
+	unsigned last = h->n ? (h->n - 1) % HIST : 0;
+	double cur = h->n ? h->v[g][last] : NAN;
+	double hi_now = laddered && h->n ? d->rung[h->rung[g][last]] : d->hi;
+	unsigned char col_now = laddered && h->n ? rung_col[h->rung[g][last]] : C_DIM;
 	char val[32], top[16], bot[16];
 	int k;
 
 	/* title: arrow, name, current value, direction hint */
-	if (isfinite(cur))
+	if (!isfinite(cur))
+		snprintf(val, sizeof(val), "-");
+	else if (d->fmt)
 		snprintf(val, sizeof(val), d->fmt, cur);
 	else
-		snprintf(val, sizeof(val), "-");
+		human(val, sizeof(val), cur);
 	put_cell(r, c, d->neutral ? "■" : d->down ? "▼" : "▲",
 		 d->neutral ? C_CYAN : d->down ? C_YELLOW : C_GREEN);
 	put_textf(r, c + 2, w - 2, A_BOLD, "%s", d->name);
-	put_textf(r, c + 2 + (int)strlen(d->name) + 1, 12, A_BOLD | C_CYAN, "%s", val);
-	if (!d->neutral && w > 46) {
-		const char *hint = d->down ? "lower = better" : "higher = better";
-		int n = (int)strlen(hint);
+	put_textf(r, c + 2 + (int)strlen(d->name) + 1, 12,
+		  A_BOLD | (alarm ? level_col(d, cur) : C_DEF), "%s", val);
 
-		put_text(r, c + w - n - 1, n, hint, C_DIM);
+	/* range legend: every rung in its colour, the current one bracketed */
+	if (laddered && w > 50) {
+		char lab[16], item[24];
+		int x = c + w - 1;
+
+		for (int q = 3; q >= 0; q--) {
+			axis_label(lab, sizeof(lab), d->rung[q]);
+			snprintf(item, sizeof(item), q == h->rung[g][last] && h->n ? "[%s]" : " %s ", lab);
+			x -= (int)strlen(item);
+			put_text(r, x, (int)strlen(item), item,
+				 rung_col[q] | (q == h->rung[g][last] && h->n ? A_BOLD : 0));
+		}
+		put_text(r, x - 7, 6, "range:", C_DIM);
+	} else if (!d->neutral && w > 46) {
+		const char *hint = d->down ? "lower = better" : "higher = better";
+		int nh = (int)strlen(hint);
+
+		put_text(r, c + w - nh - 1, nh, hint, C_DIM);
 	}
 
-	/* scale labels: the baseline (where bars start) and the far end */
-	axis_label(top, sizeof(top), d->down ? d->lo : d->hi);
-	axis_label(bot, sizeof(bot), d->down ? d->hi : d->lo);
-	put_textf(r + 1, c, AXIS_W - 1, C_DIM, "%*s", AXIS_W - 1, top);
-	put_textf(r + ht, c, AXIS_W - 1, C_DIM, "%*s", AXIS_W - 1, bot);
+	/* scale labels: the baseline (where bars start) and the current far end */
+	axis_label(top, sizeof(top), d->down ? d->lo : hi_now);
+	axis_label(bot, sizeof(bot), d->down ? hi_now : d->lo);
+	put_textf(r + 1, c, AXIS_W - 1, d->down ? C_DIM : col_now, "%*s", AXIS_W - 1, top);
+	put_textf(r + ht, c, AXIS_W - 1, d->down ? col_now : C_DIM, "%*s", AXIS_W - 1, bot);
 	for (k = 1; k <= ht; k++)
 		put_cell(r + k, c + AXIS_W - 1, "│", C_DIM);
 
 	for (unsigned j = h->n - shown, x = c + AXIS_W + (pw - shown); j < h->n; j++, x++) {
 		unsigned i = j % HIST;
-		double f = frac(d, h->v[g][i]);
-		unsigned char col = state_col(h->st[i]);
+		double v = h->v[g][i];
+		struct graph_desc dd = *d;
+		unsigned char col;
+		double f;
 		int total;
 
+		/* each bar on the range it was taken on, in that range's colour */
+		if (laddered) {
+			dd.hi = d->rung[h->rung[g][i]];
+			col = rung_col[h->rung[g][i]];
+		} else {
+			col = level_col(d, v);
+		}
+		if (alarm && isfinite(v) && level_col(d, v) == C_RED)
+			col = C_RED;
+		f = frac(&dd, v);
 		if (f < 0) {			/* no data for this sample */
 			put_cell(d->down ? r + 1 : r + ht, x, "·", C_DIM);
 			continue;
 		}
 		total = (int)lround(f * ht * 8);
-		if (total == 0 && h->v[g][i] > d->lo)
+		if (v > dd.hi) {
+			/* off the largest range: full bar, '+' at its far end */
+			for (k = 0; k < ht; k++)
+				put_cell(d->down ? r + 1 + k : r + ht - k, x,
+					 k == ht - 1 ? "+" : blocks[8],
+					 k == ht - 1 ? (col | A_REV | A_BOLD) : col);
+			continue;
+		}
+		if (total == 0 && v > d->lo)
 			total = 1;		/* non-zero stays visible */
 
 		for (k = 0; k < ht; k++) {
@@ -526,8 +661,8 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 	if (info.telemetry)
 		order[norder++] = G_FRAME;
 	order[norder++] = G_BUSY;
-	order[norder++] = G_IPC;
-	order[norder++] = G_LLC;
+	order[norder++] = G_PF;
+	order[norder++] = G_L2;
 	order[norder++] = G_TLB;
 	order[norder++] = G_DEV;
 	order[norder++] = G_IRQ;
@@ -540,13 +675,10 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 		snprintf(t, sizeof(t), "%.0fC", m->temp_c);
 	else
 		snprintf(t, sizeof(t), "-");
-	if (isfinite(m->busy))
-		snprintf(b, sizeof(b), "%.1f%%", m->busy * 100);
-	else
-		snprintf(b, sizeof(b), "-");
-	put_textf(r0, c0 + 15, w - 15, C_DEF,
-		  "busy %s  (Linux sees %.1f%%)  %.0f MHz  %s",
-		  b, m->util * 100, m->freq_mhz, t);
+	/* hardware usage (includes EVL); Linux's figure only without a PMU */
+	snprintf(b, sizeof(b), "%.1f%%", (isfinite(m->busy) ? m->busy : m->util) * 100);
+	put_textf(r0, c0 + 15, w - 15, C_DEF, "CPU %s  %.0f MHz  %s",
+		  b, m->freq_mhz, t);
 	put_textf(r0 + 1, c0, w, C_DIM,
 		  "IRQ/s: timer %.0f  thermal %.0f  IPI %.0f  device %.0f",
 		  s->irq_timer * rate, s->irq_thermal * rate,
@@ -599,7 +731,8 @@ void ui_draw(int nslots)
 		put_text(0, cols - 28, 28, " q quit  p pause  c clear ", A_REV);
 	put_text(1, 0, cols,
 		 " \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
-		 "   colour = state of that sample: green OK, yellow WARN, red FAIL", C_DIM);
+		 "   bar colour = range it was drawn on: green < light blue < blue < magenta;"
+		 " red = too high on an RT core", C_DIM);
 
 	/* panels side by side; the event log takes the bottom rows */
 	ev_rows = rows / 6;

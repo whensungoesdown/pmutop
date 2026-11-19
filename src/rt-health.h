@@ -39,7 +39,8 @@ struct cpu_sample {
 	char		irq_dev_top[64];	/* busiest device IRQ, if any */
 
 	/* power and thermal */
-	uint64_t	freq_khz;
+	uint64_t	freq_khz;	/* cpufreq scaling_cur_freq */
+	double		eff_mhz;	/* measured average while awake, NAN if unknown */
 	uint64_t	cs_time[MAX_CS];	/* cpuidle stateN/time, µs */
 	uint32_t	nr_cs;
 	int64_t		throttle;	/* package_throttle_count, last raw value */
@@ -50,6 +51,7 @@ struct cpu_sample {
 	double		busy;		/* 0..1, from ref-cycles: includes EVL; NAN if unknown */
 	double		ipc;
 	double		llc_mpki;
+	double		l2_mpki;	/* L2 demand data read misses / 1000 instr */
 	double		tlb_mpki;
 	double		cache_mpki;
 	double		stall_pct;

@@ -27,6 +27,7 @@ enum cpu_health {
 
 struct metrics {
 	int		cpu;
+	bool		rt_core;	/* isolated real-time core: no device IRQ expected */
 	enum learn_phase phase;
 	unsigned	samples;
 
@@ -35,6 +36,7 @@ struct metrics {
 	double		busy;
 	double		ipc;
 	double		llc_mpki;
+	double		l2_mpki;
 	double		tlb_mpki;
 	double		cache_mpki;
 	double		stall_pct;

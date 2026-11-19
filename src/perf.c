@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -38,7 +39,7 @@ static long perf_event_open(struct perf_event_attr *a, pid_t pid, int cpu,
 	return syscall(__NR_perf_event_open, a, pid, cpu, group_fd, flags);
 }
 
-static const struct ev_desc ev_tab[] = {
+static struct ev_desc ev_tab[] = {
 	[EV_CYCLES]	 = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES,
 			     "cycles" },
 	[EV_INSTRUCTIONS] = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS,
@@ -68,6 +69,8 @@ static const struct ev_desc ev_tab[] = {
 			     "stalled-cycles-backend" },
 	[EV_REF_CYCLES]	 = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES,
 			     "ref-cycles" },
+	/* filled in by perf_setup_l2(); type 0 config 0 = not available */
+	[EV_L2_MISSES]	 = { 0, 0, "L2 miss (per-PMU raw event)" },
 	[EV_TASK_CLOCK]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK,
 			     "task-clock" },
 	[EV_CTX_SWITCH]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES,
@@ -117,6 +120,150 @@ double perf_ref_hz(void)
 	return count ? (double)count / dt : 0;
 }
 
+/*
+ * L2 misses have no generic perf event: the counter is model specific and
+ * lives in a named PMU ("cpu" on most machines, "cpu_core"/"cpu_atom" on
+ * Intel hybrids).  The kernel does not publish these encodings in sysfs
+ * (perf carries them in its own JSON tables), so the default is the one
+ * for this research platform and anything else is given with --l2-event:
+ *
+ *   --l2-event cpu_core:0x2124    PMU name : raw config
+ *
+ * Intel family 6 model 197 (Arrow Lake H, Core Ultra 200H) P-cores:
+ * L2_RQSTS.DEMAND_DATA_RD_MISS = event 0x24, umask 0x21, i.e. config
+ * 0x2124, as reported by "perf stat -vv -e cpu_core/l2_rqsts.demand_data_rd_miss/".
+ * Returns 0 when the event will be counted on @cpu, -1 otherwise.
+ */
+static int cpu_in_list(const char *list, int cpu)
+{
+	const char *p = list;
+
+	while (*p) {
+		char *end;
+		long lo = strtol(p, &end, 10), hi = lo;
+
+		if (end == p)
+			return 0;
+		if (*end == '-')
+			hi = strtol(end + 1, &end, 10);
+		if (cpu >= lo && cpu <= hi)
+			return 1;
+		p = *end == ',' ? end + 1 : end;
+		if (*p == '\n')
+			break;
+	}
+	return 0;
+}
+
+static int read_line(const char *path, char *buf, size_t n)
+{
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return -1;
+	if (!fgets(buf, (int)n, f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	buf[strcspn(buf, "\n")] = 0;
+	return 0;
+}
+
+static int cpu_model(void)
+{
+	char line[256];
+	int fam = -1, model = -1;
+	FILE *f = fopen("/proc/cpuinfo", "r");
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f) && (fam < 0 || model < 0)) {
+		if (fam < 0 && sscanf(line, "cpu family : %d", &fam) == 1)
+			continue;
+		if (model < 0)
+			sscanf(line, "model : %d", &model);
+	}
+	fclose(f);
+	return fam == 6 ? model : -1;
+}
+
+/* One L2-miss event per PMU: hybrid CPUs need a different code per core type. */
+#define MAX_L2_PMUS	4
+
+static struct l2_pmu {
+	char		name[32];
+	uint32_t	type;
+	uint64_t	config;
+	char		cpus[128];	/* CPUs this PMU covers */
+} l2_pmus[MAX_L2_PMUS];
+static int nr_l2_pmus;
+
+/*
+ * @spec: "pmu:config[,pmu:config...]", or NULL for the built-in table.
+ * Returns the number of PMUs configured; a PMU missing on this machine is
+ * reported in @msg and skipped.
+ */
+int perf_setup_l2(const char *spec, char *msg, size_t msglen)
+{
+	char copy[256], *tok, *save = NULL, path[160], buf[256];
+
+	nr_l2_pmus = 0;
+	msg[0] = 0;
+	if (!spec) {
+		if (cpu_model() != 197) {
+			snprintf(msg, msglen, "no L2 event known for this CPU model;"
+				 " give one with --l2-event pmu:config");
+			return 0;
+		}
+		/*
+		 * Core Ultra 200H, from "perf list --details":
+		 *   P-cores  cpu_core  L2_RQSTS.DEMAND_DATA_RD_MISS    0x2124
+		 *   E-cores  cpu_atom  MEM_LOAD_UOPS_RETIRED.L2_MISS   0x80d1
+		 *   LP E     cpu_lowpower: same core type as the E-cores;
+		 *            perf lists no table for it, 0x80d1 counts plausibly.
+		 * The E-core event counts retired loads that missed L2, the
+		 * P-core one demand data reads: close, not identical.
+		 */
+		spec = "cpu_core:0x2124,cpu_atom:0x80d1,cpu_lowpower:0x80d1";
+	}
+	snprintf(copy, sizeof(copy), "%s", spec);
+	for (tok = strtok_r(copy, ",", &save); tok && nr_l2_pmus < MAX_L2_PMUS;
+	     tok = strtok_r(NULL, ",", &save)) {
+		struct l2_pmu *p = &l2_pmus[nr_l2_pmus];
+		unsigned long long config;
+
+		if (sscanf(tok, "%31[^:]:%llx", p->name, &config) != 2) {
+			snprintf(msg, msglen, "bad --l2-event '%s' (want pmu:0xconfig)", tok);
+			continue;
+		}
+		snprintf(path, sizeof(path), "/sys/bus/event_source/devices/%s/type", p->name);
+		if (read_line(path, buf, sizeof(buf)) < 0)
+			continue;	/* e.g. no cpu_lowpower on this chip */
+		p->type = (uint32_t)atoi(buf);
+		p->config = config;
+		snprintf(path, sizeof(path), "/sys/bus/event_source/devices/%s/cpus", p->name);
+		if (read_line(path, p->cpus, sizeof(p->cpus)) < 0)
+			snprintf(p->cpus, sizeof(p->cpus), "0-%d", 4095);	/* non-hybrid */
+		nr_l2_pmus++;
+	}
+	return nr_l2_pmus;
+}
+
+/* The L2 PMU covering @cpu, or NULL (thread mode: none, cores differ). */
+static const struct l2_pmu *l2_for_cpu(int cpu)
+{
+	for (int i = 0; cpu >= 0 && i < nr_l2_pmus; i++)
+		if (cpu_in_list(l2_pmus[i].cpus, cpu))
+			return &l2_pmus[i];
+	return NULL;
+}
+
+bool perf_l2_covers(int cpu)
+{
+	return l2_for_cpu(cpu) != NULL;
+}
+
 const char *perf_event_name(int ev)
 {
 	return ev >= 0 && ev < EV_NR ? ev_tab[ev].name : "?";
@@ -131,13 +278,28 @@ static int open_one(struct perf_group *g, int e, int group_fd)
 	attr.type = ev_tab[e].type;
 	attr.size = sizeof(attr);
 	attr.config = ev_tab[e].config;
+	if (e == EV_L2_MISSES) {
+		const struct l2_pmu *p = l2_for_cpu(g->cpu);
+
+		if (!p)
+			return -ENOENT;
+		attr.type = p->type;
+		attr.config = p->config;
+	}
 	attr.disabled = group_fd < 0;	/* the leader starts the group */
-	attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
+	attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID |
+			   PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 	attr.exclude_hv = 1;
 	attr.exclude_kernel = g->user_only;
 	if (g->pid < 0)
 		attr.exclude_idle = 1;	/* nothing to count on an idle core */
-	attr.pinned = group_fd < 0;
+	/*
+	 * Not pinned: if another user (perf, a second rt-health) holds the
+	 * counters, the kernel time-shares them instead of putting a pinned
+	 * group into the error state, where read() returns 0 for good.
+	 * The values are scaled by enabled/running time below.
+	 */
+	attr.pinned = 0;
 
 	fd = perf_event_open(&attr, g->pid, g->cpu, group_fd, 0);
 	if (fd < 0)
@@ -197,6 +359,8 @@ int perf_open(struct perf_group *g, int cpu, pid_t pid, char *err, size_t errlen
 			continue;
 		if (!g->hw && e < EV_TASK_CLOCK)
 			continue;
+		if (e == EV_L2_MISSES && !l2_for_cpu(cpu))
+			continue;	/* no L2 event for this core type */
 		/*
 		 * A missing member is not fatal: some PMUs lack the dTLB or
 		 * LLC events, and the monitor reports which checks it had
@@ -230,13 +394,18 @@ void perf_close(struct perf_group *g)
 
 /*
  * One read() of the leader returns every member:
- *   { u64 nr; struct { u64 value; u64 id; } v[nr]; }
- * Values are cumulative; deltas since the previous call are returned.
+ *   { u64 nr; u64 time_enabled; u64 time_running;
+ *     struct { u64 value; u64 id; } v[nr]; }
+ * Values are cumulative.  The deltas returned are scaled by
+ * enabled/running time, so they estimate the full interval when the
+ * counters had to be shared with another perf user.
  */
 int perf_read_interval(struct perf_group *g, int64_t out[EV_NR],
 		       bool ok[EV_NR], char *err, size_t errlen)
 {
-	uint64_t buf[1 + 2 * EV_NR];
+	uint64_t buf[3 + 2 * EV_NR];
+	uint64_t den, drun;
+	double scale;
 	ssize_t n;
 	uint64_t i;
 	int e;
@@ -246,20 +415,30 @@ int perf_read_interval(struct perf_group *g, int64_t out[EV_NR],
 		ok[e] = false;
 	}
 	n = read(g->fd[g->leader], buf, sizeof(buf));
-	if (n < (ssize_t)sizeof(uint64_t)) {
+	if (n < (ssize_t)(3 * sizeof(uint64_t))) {
 		snprintf(err, errlen, "group read(cpu%d): %s", g->cpu,
 			 n < 0 ? strerror(errno) : "short read");
 		return -1;
 	}
-	for (i = 0; i < buf[0] && 2 + 2 * i < (uint64_t)n / sizeof(uint64_t); i++) {
-		uint64_t val = buf[1 + 2 * i], id = buf[2 + 2 * i];
+	den = buf[1] - g->prev_enabled;
+	drun = buf[2] - g->prev_running;
+	g->prev_enabled = buf[1];
+	g->prev_running = buf[2];
+	g->running = den ? (double)drun / (double)den : 0;
+	scale = drun ? (double)den / (double)drun : 0;
+
+	for (i = 0; i < buf[0] && 4 + 2 * i < (uint64_t)n / sizeof(uint64_t); i++) {
+		uint64_t val = buf[3 + 2 * i], id = buf[4 + 2 * i];
 
 		for (e = 0; e < EV_NR; e++) {
 			if (!g->open[e] || g->id[e] != id)
 				continue;
-			out[e] = (int64_t)(val - g->prev[e]);
+			/* never counted in this interval: no estimate */
+			if (drun) {
+				out[e] = (int64_t)((double)(val - g->prev[e]) * scale);
+				ok[e] = true;
+			}
 			g->prev[e] = val;
-			ok[e] = true;
 			break;
 		}
 	}

@@ -40,6 +40,28 @@ struct opt {
 static volatile sig_atomic_t stop;
 static double ref_hz;		/* reference-cycle rate, 0 if unknown */
 
+/* Is @cpu in a list like "4-5", "4,5" or "2,4-7"? */
+static bool in_cpu_list(const char *list, int cpu)
+{
+	const char *p = list;
+
+	while (*p) {
+		char *end;
+		long lo = strtol(p, &end, 10), hi = lo;
+
+		if (end == p)
+			return false;
+		if (*end == '-')
+			hi = strtol(end + 1, &end, 10);
+		if (cpu >= lo && cpu <= hi)
+			return true;
+		if (*end != ',')
+			break;
+		p = end + 1;
+	}
+	return false;
+}
+
 static void on_signal(int sig)
 {
 	(void)sig;
@@ -99,6 +121,18 @@ static void derive(struct cpu_sample *s, const uint64_t cur[8],
 		d_total += cur[i] - prev[i];
 	s->util = d_total ? 1.0 - (double)d_idle / (double)d_total : 0.0;
 
+	/*
+	 * Average clock while the core was awake: unhalted core cycles over
+	 * unhalted reference cycles.  scaling_cur_freq is no use on an
+	 * isolated tickless core: it is refreshed from the Linux tick.
+	 */
+	if (ref_hz > 0 && s->ev_ok[EV_CYCLES] && s->ev_ok[EV_REF_CYCLES] &&
+	    s->ev[EV_REF_CYCLES] > 0)
+		s->eff_mhz = ref_hz / 1e6 * (double)s->ev[EV_CYCLES] /
+			     (double)s->ev[EV_REF_CYCLES];
+	else
+		s->eff_mhz = NAN;
+
 	if (ref_hz > 0 && dt_s > 0 && s->ev_ok[EV_REF_CYCLES]) {
 		s->busy = (double)s->ev[EV_REF_CYCLES] / (ref_hz * dt_s);
 		if (s->busy > 1.0)
@@ -117,12 +151,14 @@ static void derive(struct cpu_sample *s, const uint64_t cur[8],
 
 		s->llc_mpki = s->ev_ok[EV_LLC_MISSES] ?
 			(double)s->ev[EV_LLC_MISSES] * 1000.0 / ins : NAN;
+		s->l2_mpki = s->ev_ok[EV_L2_MISSES] ?
+			(double)s->ev[EV_L2_MISSES] * 1000.0 / ins : NAN;
 		s->tlb_mpki = s->ev_ok[EV_DTLB_MISSES] ?
 			(double)s->ev[EV_DTLB_MISSES] * 1000.0 / ins : NAN;
 		s->cache_mpki = s->ev_ok[EV_CACHE_MISSES] ?
 			(double)s->ev[EV_CACHE_MISSES] * 1000.0 / ins : NAN;
 	} else {
-		s->llc_mpki = s->tlb_mpki = s->cache_mpki = NAN;
+		s->llc_mpki = s->l2_mpki = s->tlb_mpki = s->cache_mpki = NAN;
 	}
 
 	if (s->ev_ok[EV_STALL_MEM] && s->ev_ok[EV_CYCLES] && s->ev[EV_CYCLES] > 0)
@@ -147,8 +183,8 @@ static const char *health_str(enum cpu_health h)
 
 static void print_header(void)
 {
-	printf("%-4s %-5s %6s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
-	       "cpu", "state", "busy%", "util%", "freqMHz", "IPC", "LLC/K", "dTLB/K",
+	printf("%-4s %-5s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
+	       "cpu", "state", "cpu%", "MHz", "IPC", "LLC/K", "dTLB/K",
 	       "cache/K", "stall%", "IRQ/s", "temp", "note");
 }
 
@@ -170,10 +206,15 @@ static void print_row(const struct cpu_sample *s, const struct metrics *m)
 	fmt_or_dash(ipc, sizeof(ipc), s->ipc, "%.2f");
 	fmt_or_dash(stall, sizeof(stall), s->stall_pct, "%.1f");
 	fmt_or_dash(tmp, sizeof(tmp), m->temp_c, "%.1f");
-	fmt_or_dash(busy, sizeof(busy), m->busy * 100.0, "%.1f");
+	/*
+	 * One usage figure: the hardware one when available (it includes
+	 * out-of-band EVL execution); Linux's /proc/stat only without a PMU.
+	 */
+	fmt_or_dash(busy, sizeof(busy),
+		    (isfinite(m->busy) ? m->busy : m->util) * 100.0, "%.1f");
 
-	printf("%-4d %-5s %6s %6.1f %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
-	       s->cpu, health_str(m->health), busy, m->util * 100.0, m->freq_mhz,
+	printf("%-4d %-5s %6s %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
+	       s->cpu, health_str(m->health), busy, m->freq_mhz,
 	       ipc, llc, tlb, cach, stall,
 	       (unsigned long long)s->irq_rate, tmp, m->why);
 }
@@ -189,18 +230,21 @@ int main(int argc, char **argv)
 	struct telem tel;
 	FILE *csv = NULL;
 	char err[256];
-	const char *cpus_arg = NULL;
+	const char *cpus_arg = NULL, *l2_spec = NULL;
+	char l2_msg[160] = "";
 	int i, c, iter, ret;
 	static const struct option lopts[] = {
 		{ "graphic", no_argument, NULL, 'g' },
+		{ "l2-event", required_argument, NULL, 'L' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	/* _only: "-graphic" works as well as "--graphic" and "-g" */
-	while ((c = getopt_long_only(argc, argv, "c:gi:n:o:p:t:vh", lopts, NULL)) != -1) {
+	while ((c = getopt_long_only(argc, argv, "c:gi:L:n:o:p:t:vh", lopts, NULL)) != -1) {
 		switch (c) {
 		case 'g': o.graphic = true; break;
+		case 'L': l2_spec = optarg; break;
 		case 'c': cpus_arg = optarg; break;
 		case 'i': o.interval_ms = atoi(optarg); break;
 		case 'n': o.count = atoi(optarg); break;
@@ -215,6 +259,8 @@ int main(int argc, char **argv)
 				" [-o out.csv] [-t telemetry.bin] [-graphic]\n"
 				"  -graphic  full-screen charts"
 				" (keys: q quit, p pause, c clear events)\n"
+				"  --l2-event PMU:CONFIG[,PMU:CONFIG]  raw L2-miss event per core type"
+				" (built in for Core Ultra 200H)\n"
 				"  Default CPU list: /sys/devices/system/cpu/isolated.\n"
 				"  CPU-wide counters need root and a working PMU;\n"
 				"  without them the /proc and sysfs signals remain.\n");
@@ -264,6 +310,14 @@ int main(int argc, char **argv)
 	if (ref_hz <= 0)
 		fprintf(stderr, "no ref-cycles counter: busy%% unavailable\n");
 
+	/* L2 events are per core type; a core without one just has no L2 data. */
+	if (perf_setup_l2(l2_spec, l2_msg, sizeof(l2_msg)) == 0 || l2_msg[0])
+		fprintf(stderr, "L2 misses: %s\n", l2_msg[0] ? l2_msg : "no event configured");
+	for (i = 0; i < o.nr_cpus; i++)
+		if (o.cpus[i] >= 0 && !perf_l2_covers(o.cpus[i]))
+			fprintf(stderr, "cpu%d: no L2-miss event for this core type\n", o.cpus[i]);
+
+
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
@@ -275,6 +329,13 @@ int main(int argc, char **argv)
 		cs[i].cpu = target;
 		cs[i].throttle = -1;
 		metrics_init(&met[i], target);
+		{
+			char iso[128];
+
+			met[i].rt_core = o.pid <= 0 &&
+					 sys_rt_cpus(iso, sizeof(iso)) == 0 &&
+					 in_cpu_list(iso, target);
+		}
 
 		if (o.pid > 0)
 			cs[i].cpu = 0;	/* task-level sample: no per-core view */
@@ -308,7 +369,7 @@ int main(int argc, char **argv)
 		}
 		fprintf(csv, "t_s,cpu,state,util,ipc,llc_mpki,dtlb_mpki,"
 			     "cache_mpki,stall_pct,irq_rate,irq_timer,irq_thermal,"
-			     "irq_ipi,irq_device,freq_mhz,temp_c,busy\n");
+			     "irq_ipi,irq_device,freq_mhz,temp_c,busy,page_faults,l2_mpki\n");
 	}
 
 	if (o.graphic) {
@@ -424,7 +485,7 @@ int main(int argc, char **argv)
 
 			if (csv)
 				fprintf(csv, "%.3f,%d,%s,%.4f,%.3f,%.3f,%.3f,%.3f,"
-					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f\n",
+					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f,%lld,%.4f\n",
 					now / 1e9, cs[i].cpu,
 					health_str(met[i].health), met[i].util,
 					met[i].ipc, met[i].llc_mpki, met[i].tlb_mpki,
@@ -434,7 +495,10 @@ int main(int argc, char **argv)
 					(unsigned long long)cs[i].irq_thermal,
 					(unsigned long long)cs[i].irq_ipi,
 					(unsigned long long)cs[i].irq_device,
-					met[i].freq_mhz, met[i].temp_c, met[i].busy);
+					met[i].freq_mhz, met[i].temp_c, met[i].busy,
+					cs[i].ev_ok[EV_PAGE_FAULT] ?
+						(long long)cs[i].ev[EV_PAGE_FAULT] : -1LL,
+					cs[i].l2_mpki);
 		}
 
 		if (o.graphic && !ui_paused())

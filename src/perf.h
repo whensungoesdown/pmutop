@@ -22,6 +22,7 @@ enum {
 	EV_DTLB_MISSES,
 	EV_STALL_MEM,
 	EV_REF_CYCLES,		/* unhalted cycles at the fixed reference rate */
+	EV_L2_MISSES,		/* model-specific raw event, see perf_setup_l2() */
 	EV_TASK_CLOCK,		/* software: only meaningful for a thread */
 	EV_CTX_SWITCH,		/* software: a thread leaving the OOB stage */
 	EV_PAGE_FAULT,		/* software: a thread faulting and demoting */
@@ -46,10 +47,14 @@ struct perf_group {
 	uint64_t	id[EV_NR];	/* kernel event id, to decode group reads */
 	bool		open[EV_NR];
 	uint64_t	prev[EV_NR];
+	uint64_t	prev_enabled, prev_running;	/* group times, ns */
+	double		running;	/* share of the last interval actually counted */
 };
 
 const char *perf_event_name(int ev);
 double perf_ref_hz(void);
+int  perf_setup_l2(const char *spec, char *msg, size_t msglen);
+bool perf_l2_covers(int cpu);
 int  perf_open(struct perf_group *g, int cpu, pid_t pid, char *err, size_t errlen);
 void perf_close(struct perf_group *g);
 int  perf_read_interval(struct perf_group *g, int64_t out[EV_NR], bool ok[EV_NR],
