@@ -20,18 +20,87 @@ Cores isolated from the Linux scheduler (`isolcpus`), as used for real-time work
 
 ## Contents
 
-1. [Quick start](#quick-start)
-2. [Options](#options)
-3. [The graphic view](#the-graphic-view)
-4. [Text and CSV output](#text-and-csv-output)
-5. [How pmutop measures](#how-pmutop-measures)
-6. [Hardware events](#hardware-events)
-7. [Warnings](#warnings)
-8. [Real-time and Xenomai support](#real-time-and-xenomai-support)
-9. [Reading the numbers: common bottlenecks](#reading-the-numbers-common-bottlenecks)
-10. [Requirements and limitations](#requirements-and-limitations)
-11. [Validation](#validation)
-12. [Source layout](#source-layout)
+1. [Installation](#installation)
+2. [Supported CPUs](#supported-cpus)
+3. [Quick start](#quick-start)
+4. [Options](#options)
+5. [The graphic view](#the-graphic-view)
+6. [Text and CSV output](#text-and-csv-output)
+7. [How pmutop measures](#how-pmutop-measures)
+8. [Hardware events](#hardware-events)
+9. [Warnings](#warnings)
+10. [Real-time and Xenomai support](#real-time-and-xenomai-support)
+11. [Reading the numbers: common bottlenecks](#reading-the-numbers-common-bottlenecks)
+12. [Requirements and limitations](#requirements-and-limitations)
+13. [Troubleshooting and FAQ](#troubleshooting-and-faq)
+14. [Validation](#validation)
+15. [Source layout](#source-layout)
+
+## Installation
+
+pmutop is a single C program with no dependencies beyond the C library and libm: no ncurses, no libperf, no perf tool.
+
+```
+git clone <this repository> pmutop
+cd pmutop
+make                # needs a C compiler (gcc or clang) and make
+make check          # optional unit test
+```
+
+**Requirements**
+
+- Linux with `perf_event_open()`. Tested on 6.18; any recent kernel should do.
+- A CPU with a hardware PMU that the kernel exposes. Most virtual machines, including WSL2, do not expose one; see the [FAQ](#troubleshooting-and-faq).
+- A UTF-8 terminal for the full-screen view.
+
+### Running without root
+
+Counting every core needs privileges. The options, from most to least contained:
+
+| Option | Command | Notes |
+|---|---|---|
+| Run with sudo | `sudo ./pmutop` | Simplest |
+| Give the binary `CAP_PERFMON` (Linux 5.8+) | `sudo setcap cap_perfmon+ep ./pmutop` | Then run `./pmutop` as a normal user. Tested. File capabilities are ignored on `nosuid` mounts such as `/tmp`, so keep the binary elsewhere |
+| Lower the system-wide restriction | `sudo sysctl kernel.perf_event_paranoid=0` | Lets **every** user count CPU-wide and see other users' activity. Not recommended on shared machines. Lasts until reboot |
+
+Without any of these, pmutop can only follow your own threads (`-p`), counting user space only.
+
+## Supported CPUs
+
+| CPU | Works out of the box | Needs event codes |
+|---|---|---|
+| Intel Core Ultra 200H (Arrow Lake H, family 6 model 197): P-, E- and LP E-cores | everything; tested | — |
+| Other Intel and AMD x86 CPUs | CPU usage\*, clock\*, IPC, last-level-cache misses, iTLB/dTLB misses, page faults, interrupts | L1I, L1D, L2 charts |
+| ARM64 | IPC, cache and TLB events where the PMU maps them, page faults, interrupts | L1I, L1D, L2; not tested |
+
+\* CPU usage and clock use the reference-cycle event. Where a PMU lacks it (not tested, but AMD may), pmutop falls back to Linux's `/proc/stat` usage and the cpufreq clock.
+
+Only the Core Ultra 200H has been tested. Charts without an event show `-` or stay empty; everything else keeps working.
+
+### Adding event codes for your CPU
+
+L1I, L1D and L2 misses need model-specific codes, one per core type. To find them:
+
+1. **List the PMUs.** `ls /sys/bus/event_source/devices/`. Non-hybrid x86 CPUs have one, `cpu`; Intel hybrids have `cpu_core`, `cpu_atom` and sometimes `cpu_lowpower`.
+2. **Find the events.** `perf list --details` lists them with their encoding. Good candidates on Intel are `mem_load_retired.l1_miss` (L1D), `l2_rqsts.demand_data_rd_miss` (L2) and `frontend_retired.l1i_miss` (L1I); E-cores use `mem_load_uops_retired.*` and `frontend_retired.icache`. For example:
+
+   ```
+   $ perf list --details | grep -A2 "l2_rqsts.demand_data_rd_miss$"
+     l2_rqsts.demand_data_rd_miss
+          [Demand Data Read miss L2 cache. Unit: cpu_core]
+           cpu_core/event=0x24,period=200003,umask=0x21/
+   ```
+
+3. **Turn the fields into a code.** The bit positions are in `/sys/bus/event_source/devices/<pmu>/format/`. On Intel, `event` is `config:0-7` and `umask` is `config:8-15`, so `event=0x24,umask=0x21` gives `0x2124`. A field that lives in `config1` goes in the third part of the spec. On P-cores, for example, `frontend` is `config1:0-23`, so `frontend_retired.l1i_miss` (`event=0xc6,umask=0x3,frontend=0x12`) becomes `cpu_core:0x03c6:0x12`. Ignore `period`; it only matters for sampling.
+4. **Pass them to pmutop**, one `PMU:config[:config1]` per core type:
+
+   ```
+   sudo ./pmutop --l2-event cpu_core:0x2124,cpu_atom:0x80d1
+   ```
+
+5. **Check them** against perf on a busy core. Run `perf stat -e <pmu>/<event-name>/,<pmu>/instructions/ -C 3 -- sleep 5` next to `sudo ./pmutop -b -c 3`, and compare misses per 1000 instructions.
+
+If you add codes for another CPU, please contribute them so they can be built in.
 
 ## Quick start
 
@@ -217,7 +286,7 @@ Notes:
 - **L1D and L1I count retired instructions.** L1D counts loads that missed L1D; L1I counts instructions fetched after an L1I miss. Prefetches and wrong-path fetches are excluded, so these are the misses that actually affect execution, and P- and E-cores measure the same thing. The generic P-core L1I event (`L2_RQSTS.ALL_CODE_RD`) counts every code request sent to L2, including prefetches. That read 5–8× the real misses and was not used.
 - **L2 differs slightly between core types.** On P-cores the event counts demand data-read requests that missed L2, on E-cores retired loads that missed L2. Compare P- and E-core L2 numbers with care.
 - **LP E-cores** have no event table in perf; they share the E-core design, and the E-core codes are used.
-- **Other CPUs.** Give the codes with `--l2-event`, `--l1d-event` and `--l1i-event`, one `PMU:config[:config1]` per core type, for example `--l1i-event cpu_core:0x03c6:0x12,cpu_atom:0x20c6`. To find a code, run `perf stat -vv -e <pmu>/<event-name>/` and read the `config` (and `config1`) values. A core whose type has no code shows no data for that chart; everything else still works.
+- **Other CPUs.** Give the codes with `--l2-event`, `--l1d-event` and `--l1i-event`, one `PMU:config[:config1]` per core type, for example `--l1i-event cpu_core:0x03c6:0x12,cpu_atom:0x20c6`. See [Adding event codes for your CPU](#adding-event-codes-for-your-cpu). A core whose type has no code shows no data for that chart; everything else still works.
 
 ## Warnings
 
@@ -307,13 +376,37 @@ A high miss rate is not by itself a sign of trouble. The reliable sign is a core
 
 ## Requirements and limitations
 
-- **Linux** with `perf_event_open()`. CPU-wide counting needs root or `perf_event_paranoid` ≤ 0. As an unprivileged user with `perf_event_paranoid` = 2, only `-p` on your own threads works, counting user space only; pmutop falls back to that automatically.
-- **Virtual machines** (including WSL2) usually expose no hardware PMU. pmutop then shows only software events and `/proc` / sysfs data.
-- **x86 / Intel** is what pmutop has been tested on. Built-in raw codes exist for Core Ultra 200H only. Generic events work elsewhere, and raw codes can be given on the command line. ARM and AMD have not been tested.
+- See [Installation](#installation) for the kernel, privileges and terminal, and [Supported CPUs](#supported-cpus) for hardware.
 - **Counter budget.** Each core has a few general-purpose counters (on the reference P-cores, a group of 10 programmable events no longer fits; 7 do), plus fixed counters. Adding events means removing others, or splitting groups, which the kernel then rotates.
 - **`stall%`** uses the generic back-end-stall event, which most Intel cores do not provide.
 - **Baseline drift.** A slowdown that lasts longer than the 120-sample learning window becomes the new normal and stops warning. This is deliberate, so the tool adapts to real changes in workload. For real-time work, frame telemetry (FAIL) covers sustained degradation.
 - The warnings still use last-level-cache MPKI, while the charts show L2.
+
+## Troubleshooting and FAQ
+
+**Every chart is empty, or shows `-`.** pmutop cannot open hardware counters. The message at start-up (printed after you quit the full-screen view) says why:
+- `Permission denied`: run with `sudo`, or see [Running without root](#running-without-root).
+- `no hardware PMU events (No such file or directory)`: there is no PMU, which is typical in a virtual machine or WSL2. Only page faults, interrupts and `/proc` data are available.
+
+**Only some charts are empty.** That chart's event does not exist on this CPU or core type, for example L1I/L1D/L2 without codes ([Supported CPUs](#supported-cpus)), or `stall%` on most Intel cores. A message such as `cpu6: no L2-miss event for this core type` names it.
+
+**`counter group not scheduled`.** The core's counters are all in use, so pmutop's group could not be placed. Typical holders are another `perf record` / `perf stat`, a profiler, or the kernel's NMI watchdog, which keeps one counter. Stop the other user, or free the watchdog's counter with `sudo sysctl kernel.nmi_watchdog=0`. Counters shared with another user are time-sliced and scaled automatically; this message appears only when pmutop's group never gets a turn.
+
+**IPC or miss rates look extreme on an idle core.** An idle core runs a few hundred to a few thousand instructions per interval, mostly cold interrupt code, so the ratios are meaningless. The CPU-usage chart shows when that is the case. Warnings ignore samples below 1.5 % usage.
+
+**pmutop shows load where `top` shows an idle core.** On Xenomai / EVL and similar dual-kernel systems, out-of-band real-time threads are invisible to Linux. pmutop measures usage from the hardware and sees them; `top` does not. On ordinary Linux both should roughly agree.
+
+**`MHz` differs from `/proc/cpuinfo` or `scaling_cur_freq`.** pmutop shows the average clock while the core was actually running. The cpufreq value is a request or a snapshot. On isolated tickless cores it is refreshed only on the Linux tick, and it says nothing about short bursts after idle. A core that wakes briefly from C1E, for example, can show well under its set frequency.
+
+**`--graphic needs a terminal`.** The full-screen view needs a terminal on stdin and stdout. When piping or redirecting, use `--batch`; that is also the default then.
+
+**Boxes or `?` instead of bars.** The terminal is not in UTF-8, or the font lacks block characters. Check `locale` (it should say UTF-8) and use a font such as DejaVu Sans Mono.
+
+**Not all cores fit.** Switch pages with ← / → or PgUp / PgDn, show fewer charts (`-s cpu,ipc,l2`) or fewer cores (`-c 0-7`), or widen the terminal.
+
+**A stress test disturbs the isolated cores although it was pinned elsewhere.** `stress-ng --cache` moves its workers onto every CPU by itself, ignoring `taskset`. Add `--cache-no-affinity`.
+
+**Two pmutop instances, or pmutop and perf, at once.** This is supported: counters are time-sliced and values scaled. Each instance still adds one counter read per core per interval.
 
 ## Validation
 

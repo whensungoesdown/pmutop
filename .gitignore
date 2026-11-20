@@ -1,0 +1,3 @@
+/pmutop
+*.o
+/tests/test_irq
