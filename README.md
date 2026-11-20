@@ -16,7 +16,7 @@ Cores isolated from the Linux scheduler (`isolcpus`), as used for real-time work
 
 ![pmutop on a 16-core Intel Core Ultra 9 285H](docs/pmutop-screenshot.png)
 
-*`pmutop` with no options on a 16-core Intel Core Ultra 9 285H: every core, every chart. CPU 4 and 5 are isolated real-time cores (magenta `ISOLATED` tag and dividers). The event log at the bottom shows warnings raised on CPU 2 and CPU 14.*
+*`pmutop` with no options on a 16-core Intel Core Ultra 9 285H: every chart, cores 0-11 on page 1 of 2 (←/→ to switch). CPU 4 and 5 are isolated real-time cores (magenta `ISOLATED` tag and dividers). CPU 8 and 9 are in WARN for a jump in dTLB misses per 1000 instructions; the event log at the bottom lists the state changes.*
 
 ## Contents
 
