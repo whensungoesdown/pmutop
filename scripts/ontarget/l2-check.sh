@@ -1,9 +1,9 @@
 #!/bin/bash
 # L2 miss/K on CPU 4/5: idle, evl-pingpong, cache-thrashing task;
 # cross-checked against perf stat for the same event.
-RH=/home/test/rt-health/rt-health
+RH=/home/test/pmutop/pmutop
 PP=/home/test/evl-pingpong/evl-pingpong
-cc -O2 -o /tmp/phases /home/test/rt-health/tests/phases.c || exit 1
+cc -O2 -o /tmp/phases /home/test/pmutop/tests/phases.c || exit 1
 col() { awk -F, -v c=$2 'NR==1{for(i=1;i<=NF;i++){if($i=="l2_mpki")L=i; if($i=="llc_mpki")C=i; if($i=="busy")B=i}}
 	NR>2 && $2==c {l+=$L; m+=$C; b+=$B; n++} END{printf "cpu%d L2/K %.3f  LLC/K %.3f  busy %.1f%%\n", c, l/n, m/n, 100*b/n}' "$1"; }
 echo "== idle";     taskset -c 0 $RH -c 4,5 -n 6 -o /tmp/l0.csv 2>&1 | grep -i l2; col /tmp/l0.csv 4; col /tmp/l0.csv 5

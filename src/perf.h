@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef RT_HEALTH_PERF_H
-#define RT_HEALTH_PERF_H
+#ifndef PMUTOP_PERF_H
+#define PMUTOP_PERF_H
 
 #include <stdbool.h>
 #include <stdint.h>

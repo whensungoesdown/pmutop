@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef RT_HEALTH_UI_H
-#define RT_HEALTH_UI_H
+#ifndef PMUTOP_UI_H
+#define PMUTOP_UI_H
 
-#include "rt-health.h"
+#include "pmutop.h"
 #include "metrics.h"
 
 struct ui_info {

@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "rt-health.h"
+#include "pmutop.h"
 
 static const char *hdr =
 "           CPU0       CPU1       CPU2       CPU3       CPU4       CPU5       CPU6       CPU7       CPU8       CPU9       CPU10      CPU11      CPU12      CPU13      CPU14      CPU15\n";
@@ -43,7 +43,7 @@ static void snapshot(const char *path, unsigned long k)
 
 int main(void)
 {
-	const char *path = "/tmp/rt-health-test-interrupts";
+	const char *path = "/tmp/pmutop-test-interrupts";
 	struct cpu_sample s;
 
 	memset(&s, 0, sizeof(s));

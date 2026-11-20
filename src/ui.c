@@ -798,7 +798,7 @@ void ui_draw(int nslots)
 	/* title bar */
 	localtime_r(&wall, &tm);
 	snprintf(title, sizeof(title),
-		 " rt-health  %02d:%02d:%02d  %s  every %d ms%s%s%s",
+		 " pmutop  %02d:%02d:%02d  %s  every %d ms%s%s%s",
 		 tm.tm_hour, tm.tm_min, tm.tm_sec, info.mode, info.interval_ms,
 		 info.csv ? "  csv " : "", info.csv ? info.csv : "",
 		 paused ? "  [PAUSED]" : "");

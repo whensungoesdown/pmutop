@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * mock_rt.c - stand-in for an EVL task, for testing rt-health without a
+ * mock_rt.c - stand-in for an EVL task, for testing pmutop without a
  * real-time kernel.  Publishes frame telemetry exactly as the real-time
  * side would (rft_publish(), no syscall), at a fixed period, and misses
  * every 100th deadline on purpose.

@@ -1,5 +1,5 @@
 #!/bin/bash
-RH=/home/test/rt-health/rt-health
+RH=/home/test/pmutop/pmutop
 PP=/home/test/evl-pingpong/evl-pingpong
 cd /tmp
 echo "===== 1: pingpong 60 s + stress on non-RT cores, no injection (expect no WARN)"

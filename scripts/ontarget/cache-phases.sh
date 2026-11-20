@@ -1,6 +1,6 @@
 #!/bin/bash
-RH=/home/test/rt-health/rt-health
-cd /home/test/rt-health && cc -O2 -o /tmp/phases tests/phases.c || exit 1
+RH=/home/test/pmutop/pmutop
+cd /home/test/pmutop && cc -O2 -o /tmp/phases tests/phases.c || exit 1
 taskset -c 0 "$RH" -c 4 -i 500 -n 150 -o /tmp/c.csv > /tmp/c.txt 2>&1 & M=$!
 sleep 2
 taskset -c 4 /tmp/phases 50 20

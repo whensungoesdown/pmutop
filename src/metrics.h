@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef RT_HEALTH_METRICS_H
-#define RT_HEALTH_METRICS_H
+#ifndef PMUTOP_METRICS_H
+#define PMUTOP_METRICS_H
 
-#include "rt-health.h"
+#include "pmutop.h"
 
 enum base_metric {
 	M_LLC_MPKI = 0,

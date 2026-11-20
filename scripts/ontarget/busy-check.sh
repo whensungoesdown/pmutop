@@ -1,8 +1,8 @@
 #!/bin/bash
 # Validate busy% (ref-cycles) against workloads with a known duty cycle.
-RH=/home/test/rt-health/rt-health
+RH=/home/test/pmutop/pmutop
 PP=/home/test/evl-pingpong/evl-pingpong
-cc -O2 -o /tmp/phases /home/test/rt-health/tests/phases.c || exit 1
+cc -O2 -o /tmp/phases /home/test/pmutop/tests/phases.c || exit 1
 avg() { awk -F, -v c=$1 'NR>2 && $2==c {b+=$17; u+=$4; n++} END{printf "cpu%d busy %.1f%%  linux util %.1f%%  (%d samples)\n", c, 100*b/n, 100*u/n, n}' "$2"; }
 echo "== idle"
 taskset -c 0 $RH -c 4,5 -i 1000 -n 6 -o /tmp/b0.csv > /dev/null 2>&1; avg 4 /tmp/b0.csv; avg 5 /tmp/b0.csv

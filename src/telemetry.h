@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef RT_HEALTH_TELEMETRY_H
-#define RT_HEALTH_TELEMETRY_H
+#ifndef PMUTOP_TELEMETRY_H
+#define PMUTOP_TELEMETRY_H
 
 #include <stdint.h>
 #include <sys/types.h>

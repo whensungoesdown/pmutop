@@ -15,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "rt-health.h"
+#include "pmutop.h"
 
 #define SYS_CPU	"/sys/devices/system/cpu"
 

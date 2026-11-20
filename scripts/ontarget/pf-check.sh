@@ -1,7 +1,7 @@
 #!/bin/bash
 # Page-fault counting on an RT core: pingpong alone (expect 0), then a
 # Linux task on CPU 4 that keeps touching fresh memory (expect many).
-RH=/home/test/rt-health/rt-health
+RH=/home/test/pmutop/pmutop
 PP=/home/test/evl-pingpong/evl-pingpong
 cat > /tmp/faulter.c <<'C'
 #include <stdlib.h>

@@ -1,5 +1,5 @@
 #!/bin/bash
-RH=/home/test/rt-health/rt-health
+RH=/home/test/pmutop/pmutop
 PP=/home/test/evl-pingpong/evl-pingpong
 cd /tmp
 row() { grep -E "A wakeup|Round trip" "$1" | awk -F'|' '{gsub(/ /,"",$2); printf "  %-10s avg %6s p99.9 %6s max %6s\n", substr($2,1,10), $5, $8, $9}'; grep -q "Real-time.*PASS" "$1" && echo "  PASS" || echo "  FAIL"; }

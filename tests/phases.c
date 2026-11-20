@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 /*
  * phases.c - a workload whose cache behaviour changes on cue, to check
- * that rt-health's learned baseline catches the change.
+ * that pmutop's learned baseline catches the change.
  *
  *   phases <calm_s> <thrash_s>
  *

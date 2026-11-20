@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * rt_frames.h - in-band-free frame telemetry shared between an EVL
- * real-time task and an ordinary Linux observer (rt-health).
+ * real-time task and an ordinary Linux observer (pmutop).
  *
  * The real-time side only stores values and flips an atomic sequence
  * word: no syscall, no lock, no allocation.  The observer reads with a

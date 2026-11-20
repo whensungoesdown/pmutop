@@ -1,6 +1,8 @@
-# rt-health：实时核负载与资源干扰监测
+# pmutop：逐核硬件计数器监测与瓶颈定位
 
-rt-health 用于监测 Xenomai 4（EVL）系统中隔离实时核的运行状态。它综合硬件性能计数器（缓存未命中、TLB 未命中、IPC、后端停顿）、系统统计（利用率、中断、频率、温度）和实时任务自身上报的帧耗时，在实时环境即将过载时提前告警。
+pmutop 是一个类似 top 的逐核监测工具：用 CPU 的硬件性能计数器（PMU）实时显示每个核的使用率、IPC、L1I / L1D / L2 缓存未命中、iTLB / dTLB 未命中、缺页、频率和中断，帮助判断一个核的瓶颈在哪里，并在某个核偏离它自己的正常水平时告警。
+
+对从 Linux 隔离出来的实时核（`isolcpus`，例如 Xenomai 4 / EVL 系统），pmutop 另有专门支持：以硬件计数测量包含带外（EVL）线程在内的真实使用率，对实时核采用更严格的告警规则，并可读取实时任务自身上报的帧耗时，在实时环境即将过载时提前告警。本项目最初为此而写（原名 rt-health），下文的测试数据均来自 Xenomai 4 实机。
 
 ## 1. 设计依据
 
@@ -11,7 +13,7 @@ rt-health 用于监测 Xenomai 4（EVL）系统中隔离实时核的运行状态
 
 ### 1.2 不看绝对值，看相对基线
 
-缺失率的绝对值本身不能说明问题。顺序扫描大数组的程序，末级缓存（LLC）几乎每次访问都会未命中，但它照样能跑满内存带宽，效率并不低。所以 rt-health：
+缺失率的绝对值本身不能说明问题。顺序扫描大数组的程序，末级缓存（LLC）几乎每次访问都会未命中，但它照样能跑满内存带宽，效率并不低。所以 pmutop：
 
 1. 把计数换算为**每千条指令的未命中数（MPKI）**，与任务的执行速度无关；
 2. 为每个核**学习自己的正常范围**：保留最近 120 个采样，以中位数和 MAD（中位数绝对偏差）估计基线和离散度；
@@ -22,8 +24,8 @@ rt-health 用于监测 Xenomai 4（EVL）系统中隔离实时核的运行状态
 ### 1.3 监测本身不能干扰实时核
 
 - **只计数，不采样。** 在 Dovetail 内核上，PMU 溢出中断（PMI）通过 NMI 处理函数 `perf_event_nmi_handler()` 送达（`arch/x86/events/core.c`，注册为 `NMI_LOCAL`）。NMI 不受中断流水线管控，会直接打断实时线程。计数模式在读取之前不产生任何中断。
-- **与其他计数器用户共享。** 计数组不独占（非 pinned）：perf 或另一个 rt-health 同时使用计数器时，内核分时复用，rt-health 按“启用时间/实际计数时间”换算出整个周期的估计值；若独占，计数组会进入错误状态，此后读数一直为空。
-- **每个采样周期只发一次 IPI。** 读取一个处于活动状态的核级 perf 事件，要在该事件所属的核上完成：内核经 `perf_event_read()` → `smp_call_function_single()` 向被监测的核发送 IPI（`kernel/events/core.c`）；停止、启动事件也各需一次 IPI。rt-health 把全部事件放在一个组内，以 `PERF_FORMAT_GROUP` 对组长做一次 `read()` 取回所有值，每核每个采样周期只有一次 IPI。在 Dovetail 内核上这是一个带内中断：实时线程运行时它只被记入日志，等该核回到 Linux 时才执行，因此不会抢占实时线程，只付出一次流水线入口开销。
+- **与其他计数器用户共享。** 计数组不独占（非 pinned）：perf 或另一个 pmutop 同时使用计数器时，内核分时复用，pmutop 按“启用时间/实际计数时间”换算出整个周期的估计值；若独占，计数组会进入错误状态，此后读数一直为空。
+- **每个采样周期只发一次 IPI。** 读取一个处于活动状态的核级 perf 事件，要在该事件所属的核上完成：内核经 `perf_event_read()` → `smp_call_function_single()` 向被监测的核发送 IPI（`kernel/events/core.c`）；停止、启动事件也各需一次 IPI。pmutop 把全部事件放在一个组内，以 `PERF_FORMAT_GROUP` 对组长做一次 `read()` 取回所有值，每核每个采样周期只有一次 IPI。在 Dovetail 内核上这是一个带内中断：实时线程运行时它只被记入日志，等该核回到 Linux 时才执行，因此不会抢占实时线程，只付出一次流水线入口开销。
 - **监测进程运行在非实时核上**，用 `taskset` 绑定即可。
 
 ## 2. 实时核过载的成因与对应指标
@@ -54,10 +56,10 @@ rt-health 用于监测 Xenomai 4（EVL）系统中隔离实时核的运行状态
 
 ```
 make
-sudo ./rt-health                 # 默认监测 /sys/devices/system/cpu/isolated 中的核
-sudo ./rt-health -c 4,5 -i 1000 -o rt.csv
-sudo ./rt-health -p <tid>        # 跟踪一个实时线程，同时报告降级相关的软件事件
-./rt-health -c 4 -t /dev/shm/rt-telemetry.bin   # 读取实时任务上报的帧数据
+sudo ./pmutop                 # 默认监测 /sys/devices/system/cpu/isolated 中的核
+sudo ./pmutop -c 4,5 -i 1000 -o rt.csv
+sudo ./pmutop -p <tid>        # 跟踪一个实时线程，同时报告降级相关的软件事件
+./pmutop -c 4 -t /dev/shm/rt-telemetry.bin   # 读取实时任务上报的帧数据
 ```
 
 | 选项 | 含义 |
@@ -72,12 +74,12 @@ sudo ./rt-health -p <tid>        # 跟踪一个实时线程，同时报告降级
 | `--show LIST` | 图形界面显示哪些图表及其顺序，逗号分隔：`frame,cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb`，或 `all`（默认）。例如 `--show cpu,l1d,l2` |
 | `--l2-event` / `--l1d-event` / `--l1i-event PMU:编码[:编码1][,…]` | L2 / L1D / L1I 未命中的原始事件，按核心类型指定（Core Ultra 200H 内置）；`编码1` 写入 `config1`，例如 P 核 L1I 的 frontend 选择字段 |
 
-建议把监测进程绑定到非实时核：`taskset -c 0 sudo ./rt-health ...`。
+建议把监测进程绑定到非实时核：`taskset -c 0 sudo ./pmutop ...`。
 
 ### 图形界面（-graphic）
 
 ```
-sudo taskset -c 0 ./rt-health -c 4,5 -i 500 -graphic
+sudo taskset -c 0 ./pmutop -c 4,5 -i 500 -graphic
 ```
 
 类似 htop 的全屏界面。被监测的核**横向并排**，每核一列；每列内各项指标**纵向排列**，每项是一个数行高的滚动柱状图，每个采样一根柱，最新的在最右：
@@ -138,7 +140,7 @@ sudo taskset -c 0 ./rt-health -c 4,5 -i 500 -graphic
 
 ### CPU 使用率（cpu%）
 
-`/proc/stat` 是 Linux 自己的统计，看不到带外（EVL）线程的执行时间：运行 evl-pingpong 的核上它显示 0%。rt-health 改用硬件计数：核心非空闲时的参考周期数（`ref-cycles`，x86 上以 TSC 频率计数，停机时不计数）除以“参考频率 × 采样间隔”。参考频率在启动时用一次 0.2 s 的自测量标定。
+`/proc/stat` 是 Linux 自己的统计，看不到带外（EVL）线程的执行时间：运行 evl-pingpong 的核上它显示 0%。pmutop 改用硬件计数：核心非空闲时的参考周期数（`ref-cycles`，x86 上以 TSC 频率计数，停机时不计数）除以“参考频率 × 采样间隔”。参考频率在启动时用一次 0.2 s 的自测量标定。
 
 实机核对（ThinkBook，CPU 4、5）：
 
@@ -156,7 +158,7 @@ sudo taskset -c 0 ./rt-health -c 4,5 -i 500 -graphic
 
 perf 没有通用的 L2 事件，需要处理器型号专用的原始事件。内核不在 sysfs 中公布这些编码（它们在 perf 工具自带的 JSON 表中），因此：
 
-- 混合架构的每种核心有自己的 PMU 和事件编码，rt-health 按核选用。本研究平台（Intel family 6 model 197，Core Ultra 200H）内置：
+- 混合架构的每种核心有自己的 PMU 和事件编码，pmutop 按核选用。本研究平台（Intel family 6 model 197，Core Ultra 200H）内置：
 
   | 核心 | PMU | 事件 | 编码 |
   |---|---|---|---|
@@ -168,7 +170,7 @@ perf 没有通用的 L2 事件，需要处理器型号专用的原始事件。�
 - 其他处理器用 `--l2-event PMU:编码[,PMU:编码]` 指定，编码可用 `perf list --details` 查到；
 - 没有对应事件的核只是不显示 L2，其他核与其他指标照常。
 
-  实测核对（同一时刻，各核运行 512 MiB 随机指针追逐，单位：每千条指令未命中）：P 核 CPU 3：rt-health 16.20 / perf 16.57；E 核 CPU 7：16.67 / 16.24；LP E 核 CPU 14：26.92 / 26.96。
+  实测核对（同一时刻，各核运行 512 MiB 随机指针追逐，单位：每千条指令未命中）：P 核 CPU 3：pmutop 16.20 / perf 16.57；E 核 CPU 7：16.67 / 16.24；LP E 核 CPU 14：26.92 / 26.96。
 
 实机数据（CPU 4，单位：每千条指令未命中数）：
 
@@ -196,7 +198,7 @@ L3 的数值仍保留在文本输出和 CSV 中（`llc_mpki`），告警规则�
 - P 核 L1I 事件需要额外的 frontend 选择字段（`cpu_core/format/frontend` 为 `config1:0-23`），因此事件编码格式扩展为 `PMU:config:config1`；
 - 实测核对（同一时刻，512 MiB 随机指针追逐，每千条指令）：P 核 CPU 3 L1D 71.7 / perf 72.7，iTLB 0.96 / 0.92；E 核 CPU 7 L1D 103.6 / 106.2，iTLB 0.66 / 0.71。
 
-**计数器容量。** 一个计数组必须能同时放进核心的硬件计数器，否则内核根本不调度它，组内所有事件都读不到数（perf 显示 `<not counted>`）。实测 P 核放不下 10 个可编程事件；为此去掉了不用的三个“访问次数”事件（cache-references、LLC-loads、dTLB-loads），现在 P 核与 E 核都是 7 个可编程事件加固定计数器，均能调度。若某核的计数组始终未被调度，rt-health 会提示一次 `counter group not scheduled`。
+**计数器容量。** 一个计数组必须能同时放进核心的硬件计数器，否则内核根本不调度它，组内所有事件都读不到数（perf 显示 `<not counted>`）。实测 P 核放不下 10 个可编程事件；为此去掉了不用的三个“访问次数”事件（cache-references、LLC-loads、dTLB-loads），现在 P 核与 E 核都是 7 个可编程事件加固定计数器，均能调度。若某核的计数组始终未被调度，pmutop 会提示一次 `counter group not scheduled`。
 
 ### 输出列
 
@@ -213,8 +215,8 @@ L3 的数值仍保留在文本输出和 CSV 中（`llc_mpki`），告警规则�
 ### 权限与环境
 
 - 核级计数需要 root，或 `perf_event_paranoid` ≤ 0；
-- 非 root 且 `perf_event_paranoid` = 2 时，只能计数自己的进程，并且只计用户态。rt-health 会自动降级到这一模式；
-- 虚拟机（包括 WSL2）通常不提供硬件 PMU。此时 rt-health 只用软件事件，缓存与 TLB 列显示为 -；
+- 非 root 且 `perf_event_paranoid` = 2 时，只能计数自己的进程，并且只计用户态。pmutop 会自动降级到这一模式；
+- 虚拟机（包括 WSL2）通常不提供硬件 PMU。此时 pmutop 只用软件事件，缓存与 TLB 列显示为 -；
 - 混合架构处理器（如 Core Ultra）的 P 核和 E 核有不同的 PMU（`cpu_core`、`cpu_atom`）。本程序使用通用事件，由内核按核类型映射。
 
 ## 4. 实时任务接入帧遥测
@@ -245,7 +247,7 @@ struct rft_frame f = {
 rft_publish(me, &f);
 ```
 
-rt-health 以只读方式映射该文件，用顺序号前后两次读取的方法检测读到一半的记录，不会向共享页写入任何内容。
+pmutop 以只读方式映射该文件，用顺序号前后两次读取的方法检测读到一半的记录，不会向共享页写入任何内容。
 
 `scripts/mock_rt.c` 是一个不依赖 EVL 的模拟生产者，每 100 帧故意超时一次，用于测试监测程序。
 
@@ -272,7 +274,7 @@ rt-health 以只读方式映射该文件，用顺序号前后两次读取的方�
 |---|---|---|
 | 单元测试 `make check` | 用本机真实格式的 `/proc/interrupts` 构造两次快照 | 定时器、温度、IPI、设备四类计数全部正确；设备名解析正确 |
 | 无干扰时不误报 | evl-pingpong 60 s，同时在非实时核上运行 stress-ng（cache ×10 `--cache-no-affinity`，vm ×4 2 GiB） | 114 个采样全部 OK；pingpong 判定 PASS |
-| 计数器共享 | 两个 rt-health 实例与 perf 同时计数 CPU 2、4 | 两个实例均持续读数；L2/K 为 10.0、1.50，perf 单独测得 9.46、1.58 |
+| 计数器共享 | 两个 pmutop 实例与 perf 同时计数 CPU 2、4 | 两个实例均持续读数；L2/K 为 10.0、1.50，perf 单独测得 9.46、1.58 |
 | 设备中断检测 | 把 Wi-Fi 中断 IRQ 183 的亲和改到 CPU 4，并 ping 网关产生流量 | 改动后的第一个采样即 WARN：`device IRQ on an RT core: 91/s, busiest IRQ 183: iwlwifi:default_queue`；恢复后回到 OK |
 | 缓存劣化检测 | `tests/phases.c` 在 CPU 4 上先运行 50 s 缓存友好负载（64 KiB 顺序读），再运行 20 s 随机指针追逐（512 MiB），两阶段利用率相同（约 48%） | 平稳阶段 92 个采样全部 OK（IPC 4.84，LLC MPKI 0.003）；劣化阶段 36 个采样中 32 个 WARN（IPC 0.027，LLC MPKI 约 83，dTLB MPKI 约 79），其余 4 个位于阶段切换处 |
 | 帧遥测 | `scripts/mock_rt.c` 每 100 帧故意超时一次 | 每 500 ms 报告 5 次超周期，状态 FAIL，并给出最坏帧耗时 |

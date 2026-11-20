@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 /*
- * rt-health - watch the isolated real-time cores of a Xenomai 4 system
- * and warn when the load is about to outgrow them.
+ * pmutop - per-core hardware-counter monitor: shows live, for each CPU,
+ * what limits it (cache and TLB misses, IPC, page faults, frequency,
+ * interrupts) and warns when a core departs from its own normal level.
+ * Isolated real-time cores (isolcpus, e.g. Xenomai 4 / EVL) get stricter
+ * rules and an execution-time view that includes out-of-band threads.
  *
- * The monitor is an ordinary Linux task and must never run on the cores
- * it watches: it filters no interrupts on them, takes no PMU samples, and
- * sleeps on the wall clock between intervals.  Its only footprint on a
- * monitored core is the counter read itself, and the group is disabled
- * while that read happens (see perf.c).
+ * The monitor is an ordinary Linux task and must not run on the cores it
+ * watches: it takes no PMU samples (counting only) and sleeps on the wall
+ * clock between intervals.  Its only footprint on a monitored core is the
+ * counter read itself: one group read, one IPI per interval (see perf.c).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -20,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "rt-health.h"
+#include "pmutop.h"
 #include "metrics.h"
 #include "telemetry.h"
 #include "ui.h"
@@ -269,7 +271,7 @@ int main(int argc, char **argv)
 		case 'h':
 		default:
 			fprintf(stderr,
-				"usage: rt-health [-c 4,5|all | -p tid] [-i ms] [-n count]"
+				"usage: pmutop [-c 4,5|all | -p tid] [-i ms] [-n count]"
 				" [-o out.csv] [-t telemetry.bin] [-graphic]\n"
 				"  -graphic  full-screen charts"
 				" (keys: q quit, p pause, c clear events)\n"

@@ -7,9 +7,9 @@ LDLIBS	+= -lm
 SRCS	:= src/main.c src/perf.c src/sysfs.c src/metrics.c src/telemetry.c src/ui.c
 OBJS	:= $(SRCS:.c=.o)
 
-all: rt-health
+all: pmutop
 
-rt-health: $(OBJS)
+pmutop: $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.o: %.c
@@ -22,6 +22,6 @@ check: tests/test_irq
 	./tests/test_irq
 
 clean:
-	rm -f rt-health $(OBJS) tests/test_irq
+	rm -f pmutop $(OBJS) tests/test_irq
 
 .PHONY: all check clean

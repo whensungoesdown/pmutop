@@ -318,7 +318,7 @@ static int open_one(struct perf_group *g, int e, int group_fd)
 	if (g->pid < 0)
 		attr.exclude_idle = 1;	/* nothing to count on an idle core */
 	/*
-	 * Not pinned: if another user (perf, a second rt-health) holds the
+	 * Not pinned: if another user (perf, a second pmutop) holds the
 	 * counters, the kernel time-shares them instead of putting a pinned
 	 * group into the error state, where read() returns 0 for good.
 	 * The values are scaled by enabled/running time below.
