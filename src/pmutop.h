@@ -2,6 +2,8 @@
 #ifndef PMUTOP_H
 #define PMUTOP_H
 
+#define PMUTOP_VERSION	"0.1.0"
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>

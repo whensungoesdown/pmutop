@@ -13,6 +13,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdint.h>
 #include <getopt.h>
 #include <math.h>
 #include <signal.h>
@@ -78,37 +79,126 @@ static int64_t now_ns(void)
 	return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
-static int parse_cpus(const char *s, struct opt *o)
+/* Long-only options. */
+enum { OPT_L1I = 256, OPT_L1D, OPT_L2 };
+
+static void usage(FILE *f)
 {
-	char *copy, *tok, *save = NULL;
+	fputs(
+"Usage: pmutop [OPTION]...\n"
+"Live per-core view of CPU hardware performance counters.\n"
+"\n"
+"With no options: every online core, every chart, full-screen view\n"
+"(text lines instead when the output is not a terminal).\n"
+"\n"
+"What to watch:\n"
+"  -c, --cpus=LIST        cores: all, isolated, or a list such as 0,2,4-7\n"
+"                         (default: all)\n"
+"  -p, --pid=TID          follow one thread instead of cores\n"
+"\n"
+"How to show it:\n"
+"  -g, --graphic          full-screen charts (default on a terminal)\n"
+"  -b, --batch            one text line per core per sample\n"
+"  -s, --show=LIST        charts in the full-screen view, in this order\n"
+"                         (default: all): cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb,frame\n"
+"  -i, --interval=MS      sampling interval in milliseconds (default 1000)\n"
+"  -n, --count=N          stop after N samples (default: until q or Ctrl-C)\n"
+"  -o, --csv=FILE         also write every sample to FILE\n"
+"\n"
+"Real-time tasks:\n"
+"  -t, --telemetry=FILE   frame timing published by a real-time task\n"
+"\n"
+"Hardware events (raw code per core type: PMU:CONFIG[:CONFIG1][,...];\n"
+"built in for Intel Core Ultra 200H):\n"
+"      --l1i-event=SPEC   L1 instruction-cache misses\n"
+"      --l1d-event=SPEC   L1 data-cache misses\n"
+"      --l2-event=SPEC    L2 cache misses\n"
+"\n"
+"  -h, --help             show this help\n"
+"  -V, --version          show the version\n"
+"\n"
+"Keys in the full-screen view: q quit, p pause, c clear events,\n"
+"Left/Right or PgUp/PgDn: previous/next page when not all cores fit.\n"
+"\n"
+"CPU-wide counting needs root, or kernel.perf_event_paranoid <= 0.\n", f);
+}
+
+/* Whole-string decimal in [min, max]. */
+static int parse_int(const char *s, long min, long max, int *out)
+{
+	char *end;
+	long v;
+
+	errno = 0;
+	v = strtol(s, &end, 10);
+	if (errno || end == s || *end || v < min || v > max)
+		return -1;
+	*out = (int)v;
+	return 0;
+}
+
+static void add_cpu(struct opt *o, int cpu)
+{
+	for (int i = 0; i < o->nr_cpus; i++)
+		if (o->cpus[i] == cpu)
+			return;		/* listed twice */
+	if (o->nr_cpus < MAX_CPUS)
+		o->cpus[o->nr_cpus++] = cpu;
+}
+
+/*
+ * "all", "isolated", or a list such as "0,2,4-7".  Offline or unknown
+ * CPUs are an error rather than an empty panel.
+ */
+static int parse_cpus(const char *s, struct opt *o, char *err, size_t errlen)
+{
+	char list[512], *tok, *save = NULL;
 
 	if (strcmp(s, "all") == 0) {
 		for (int i = 0; i < MAX_CPUS; i++)
 			if (sys_cpu_online(i))
-				o->cpus[o->nr_cpus++] = i;
+				add_cpu(o, i);
 		o->all_cpus = true;
-		return o->nr_cpus ? 0 : -1;
-	}
-	copy = strdup(s);
-	if (!copy)
-		return -1;
-	for (tok = strtok_r(copy, ",", &save); tok;
-	     tok = strtok_r(NULL, ",", &save)) {
-		int lo, hi;
-
-		if (sscanf(tok, "%d-%d", &lo, &hi) == 2) {
-			for (int k = lo; k <= hi && o->nr_cpus < MAX_CPUS; k++)
-				o->cpus[o->nr_cpus++] = k;
-		} else if (sscanf(tok, "%d", &lo) == 1) {
-			if (o->nr_cpus < MAX_CPUS)
-				o->cpus[o->nr_cpus++] = lo;
-		} else {
-			free(copy);
+		if (!o->nr_cpus) {
+			snprintf(err, errlen, "no online CPU found");
 			return -1;
 		}
+		return 0;
 	}
-	free(copy);
-	return o->nr_cpus ? 0 : -1;
+	if (strcmp(s, "isolated") == 0) {
+		if (sys_rt_cpus(list, sizeof(list)) < 0 || !list[0]) {
+			snprintf(err, errlen, "no isolated CPUs (see isolcpus=)");
+			return -1;
+		}
+	} else {
+		snprintf(list, sizeof(list), "%s", s);
+	}
+
+	for (tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+		char *end;
+		long lo, hi;
+
+		lo = strtol(tok, &end, 10);
+		hi = lo;
+		if (end != tok && *end == '-')
+			hi = strtol(end + 1, &end, 10);
+		if (end == tok || *end || lo < 0 || hi < lo || hi >= MAX_CPUS) {
+			snprintf(err, errlen, "bad CPU list '%s' (want all, isolated, or e.g. 0,2,4-7)", s);
+			return -1;
+		}
+		for (long k = lo; k <= hi; k++) {
+			if (!sys_cpu_online((int)k)) {
+				snprintf(err, errlen, "CPU %ld is not online", k);
+				return -1;
+			}
+			add_cpu(o, (int)k);
+		}
+	}
+	if (!o->nr_cpus) {
+		snprintf(err, errlen, "empty CPU list");
+		return -1;
+	}
+	return 0;
 }
 
 /* Ratios from the raw deltas of one interval. */
@@ -236,62 +326,103 @@ int main(int argc, char **argv)
 	struct metrics met[MAX_CPUS];
 	uint64_t prevstat[MAX_CPUS][8], curstat[8];
 	int64_t prev_ns, now;
-	struct telem tel;
+	struct telem tel = { .fd = -1 };
 	FILE *csv = NULL;
 	char err[256];
-	const char *cpus_arg = NULL, *l2_spec = NULL, *l1d_spec = NULL, *l1i_spec = NULL;
+	const char *cpus_arg = "all", *l2_spec = NULL, *l1d_spec = NULL, *l1i_spec = NULL;
 	const char *show = NULL;
 	char raw_msg[160] = "";
-	int i, c, iter, ret;
+	enum { VIEW_AUTO, VIEW_GRAPHIC, VIEW_BATCH } view = VIEW_AUTO;
+	bool cpus_given = false;
+	int i, c, iter, ret, v;
 	static const struct option lopts[] = {
-		{ "graphic", no_argument, NULL, 'g' },
-		{ "l2-event", required_argument, NULL, 'L' },
-		{ "l1d-event", required_argument, NULL, 'D' },
-		{ "l1i-event", required_argument, NULL, 'I' },
-		{ "show", required_argument, NULL, 's' },
-		{ "help", no_argument, NULL, 'h' },
+		{ "cpus",      required_argument, NULL, 'c' },
+		{ "pid",       required_argument, NULL, 'p' },
+		{ "graphic",   no_argument,       NULL, 'g' },
+		{ "batch",     no_argument,       NULL, 'b' },
+		{ "show",      required_argument, NULL, 's' },
+		{ "interval",  required_argument, NULL, 'i' },
+		{ "count",     required_argument, NULL, 'n' },
+		{ "csv",       required_argument, NULL, 'o' },
+		{ "telemetry", required_argument, NULL, 't' },
+		{ "l1i-event", required_argument, NULL, OPT_L1I },
+		{ "l1d-event", required_argument, NULL, OPT_L1D },
+		{ "l2-event",  required_argument, NULL, OPT_L2 },
+		{ "help",      no_argument,       NULL, 'h' },
+		{ "version",   no_argument,       NULL, 'V' },
 		{ NULL, 0, NULL, 0 },
 	};
 
-	/* _only: "-graphic" works as well as "--graphic" and "-g" */
-	while ((c = getopt_long_only(argc, argv, "c:D:gI:i:L:n:o:p:s:t:vh", lopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "c:p:gbs:i:n:o:t:hV", lopts, NULL)) != -1) {
 		switch (c) {
-		case 'g': o.graphic = true; break;
-		case 'L': l2_spec = optarg; break;
-		case 'D': l1d_spec = optarg; break;
-		case 'I': l1i_spec = optarg; break;
-		case 's': show = optarg; break;
-		case 'c': cpus_arg = optarg; break;
-		case 'i': o.interval_ms = atoi(optarg); break;
-		case 'n': o.count = atoi(optarg); break;
+		case 'c':
+			cpus_arg = optarg;
+			cpus_given = true;
+			break;
+		case 'p':
+			if (parse_int(optarg, 1, INT32_MAX, &v) < 0) {
+				fprintf(stderr, "pmutop: --pid: not a thread id: %s\n", optarg);
+				return 2;
+			}
+			o.pid = (pid_t)v;
+			break;
+		case 'g':
+		case 'b':
+			if (view != VIEW_AUTO && view != (c == 'g' ? VIEW_GRAPHIC : VIEW_BATCH)) {
+				fprintf(stderr, "pmutop: --graphic and --batch are mutually exclusive\n");
+				return 2;
+			}
+			view = c == 'g' ? VIEW_GRAPHIC : VIEW_BATCH;
+			break;
+		case 's':
+			show = optarg;
+			break;
+		case 'i':
+			if (parse_int(optarg, 10, 3600000, &o.interval_ms) < 0) {
+				fprintf(stderr, "pmutop: --interval: want 10-3600000 ms, got %s\n",
+					optarg);
+				return 2;
+			}
+			break;
+		case 'n':
+			if (parse_int(optarg, 1, INT32_MAX, &o.count) < 0) {
+				fprintf(stderr, "pmutop: --count: want a positive number, got %s\n",
+					optarg);
+				return 2;
+			}
+			break;
 		case 'o': o.csv = optarg; break;
-		case 'p': o.pid = (pid_t)atoi(optarg); break;
 		case 't': o.telem = optarg; break;
-		case 'v': break;
+		case OPT_L1I: l1i_spec = optarg; break;
+		case OPT_L1D: l1d_spec = optarg; break;
+		case OPT_L2: l2_spec = optarg; break;
+		case 'V':
+			printf("pmutop %s\n", PMUTOP_VERSION);
+			return 0;
 		case 'h':
+			usage(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"usage: pmutop [-c 4,5|all | -p tid] [-i ms] [-n count]"
-				" [-o out.csv] [-t telemetry.bin] [-graphic]\n"
-				"  -graphic  full-screen charts"
-				" (keys: q quit, p pause, c clear events)\n"
-				"  --show LIST  charts for -graphic, in order:"
-				" frame,cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb (default all)\n"
-				"  --l2-event / --l1d-event / --l1i-event PMU:CONFIG[:CONFIG1][,...]"
-				"  raw event per core type (built in for Core Ultra 200H)\n"
-				"  Default CPU list: /sys/devices/system/cpu/isolated.\n"
-				"  CPU-wide counters need root and a working PMU;\n"
-				"  without them the /proc and sysfs signals remain.\n");
-			return c == 'h' ? 0 : 2;
+			fprintf(stderr, "Try 'pmutop --help'.\n");
+			return 2;
 		}
 	}
-	if (o.interval_ms < 10)
-		o.interval_ms = 10;
-
-	if (o.pid > 0 && cpus_arg) {
-		fprintf(stderr, "-p and -c are mutually exclusive\n");
+	if (optind < argc) {
+		fprintf(stderr, "pmutop: unexpected argument '%s'\nTry 'pmutop --help'.\n",
+			argv[optind]);
 		return 2;
 	}
+
+	if (o.pid > 0 && cpus_given) {
+		fprintf(stderr, "pmutop: --pid and --cpus are mutually exclusive\n");
+		return 2;
+	}
+
+	/* Full-screen view by default, text lines when not on a terminal. */
+	if (view == VIEW_AUTO)
+		o.graphic = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+	else
+		o.graphic = view == VIEW_GRAPHIC;
 
 	if (o.pid > 0) {
 		/*
@@ -301,26 +432,9 @@ int main(int argc, char **argv)
 		 * page fault, a migration between cores).
 		 */
 		o.cpus[o.nr_cpus++] = -1;
-	} else if (cpus_arg) {
-		if (parse_cpus(cpus_arg, &o) < 0) {
-			fprintf(stderr, "bad -c list: %s\n", cpus_arg);
-			return 2;
-		}
-	} else {
-		char buf[128];
-		int lo, hi;
-
-		if (sys_rt_cpus(buf, sizeof(buf)) == 0 &&
-		    sscanf(buf, "%d-%d", &lo, &hi) == 2) {
-			for (int k = lo; k <= hi && o.nr_cpus < MAX_CPUS; k++)
-				o.cpus[o.nr_cpus++] = k;
-		} else if (sys_rt_cpus(buf, sizeof(buf)) == 0 &&
-			   sscanf(buf, "%d", &lo) == 1) {
-			o.cpus[o.nr_cpus++] = lo;
-		} else {
-			o.cpus[o.nr_cpus++] = 0;
-			fprintf(stderr, "no isolated CPUs found; watching CPU 0\n");
-		}
+	} else if (parse_cpus(cpus_arg, &o, err, sizeof(err)) < 0) {
+		fprintf(stderr, "pmutop: --cpus: %s\n", err);
+		return 2;
 	}
 
 	/* Calibrate before anything else runs on this CPU. */
@@ -425,7 +539,7 @@ int main(int argc, char **argv)
 		else
 			snprintf(mode, sizeof(mode), "%d core(s)", o.nr_cpus);
 		if (ui_start(&ui) < 0) {
-			fprintf(stderr, "-graphic needs a terminal\n");
+			fprintf(stderr, "pmutop: --graphic needs a terminal; use --batch\n");
 			return 2;
 		}
 		for (i = 0; i < o.nr_cpus; i++)

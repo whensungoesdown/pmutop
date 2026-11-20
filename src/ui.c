@@ -783,55 +783,115 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 	}
 }
 
+/* Charts a panel will draw: the selection, less frame time without telemetry. */
+static int charts_shown(void)
+{
+	int n = 0;
+
+	for (int i = 0; i < nsel; i++)
+		n += sel[i] != G_FRAME || info.telemetry;
+	return n;
+}
+
+#define MIN_PANEL_W	44	/* header and range legend still readable */
+#define PANEL_GAP	3
+#define MIN_CHART_ROWS	3	/* title + 2 rows of bars */
+
+static int page;		/* current page when not all panels fit */
+
 void ui_draw(int nslots)
 {
-	int rows, cols, ev_rows, ph, pw, gap = 3, i;
+	int rows, cols, ev_rows, avail, need, cpr, prow, per_page, pages;
+	int ph, pw, first, last, i;
 	time_t wall = time(NULL);
 	struct tm tm;
-	char title[256];
+	char title[256], pg[64] = "";
 
 	if (!active)
 		return;
 	term_size(&rows, &cols);
 	grid_reset(rows, cols);
 
-	/* title bar */
-	localtime_r(&wall, &tm);
-	snprintf(title, sizeof(title),
-		 " pmutop  %02d:%02d:%02d  %s  every %d ms%s%s%s",
-		 tm.tm_hour, tm.tm_min, tm.tm_sec, info.mode, info.interval_ms,
-		 info.csv ? "  csv " : "", info.csv ? info.csv : "",
-		 paused ? "  [PAUSED]" : "");
-	for (i = 0; i < cols; i++)
-		put_cell(0, i, " ", A_REV);
-	put_text(0, 0, cols, title, A_REV | A_BOLD);
-	if (cols > 70)
-		put_text(0, cols - 28, 28, " q quit  p pause  c clear ", A_REV);
-	put_text(1, 0, cols,
-		 " \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
-		 "   bar colour = range it was drawn on: green < light blue < blue < magenta;"
-		 " red = too high on an RT core", C_DIM);
-
-	/* panels side by side; the event log takes the bottom rows */
 	ev_rows = rows / 6;
 	if (ev_rows < 4)
 		ev_rows = 4;
 	if (ev_rows > 9)
 		ev_rows = 9;
-	ph = rows - 2 - ev_rows;
-	pw = nslots ? (cols - gap * (nslots - 1)) / nslots : cols;
-	for (i = 0; i < nslots; i++)
-		draw_panel(&hist[i], 2, i * (pw + gap), pw, ph);
-	/*
-	 * Dividers between panels; the edges of an isolated core's panel are
-	 * drawn heavy and magenta, so the real-time cores read as one block.
-	 */
-	for (i = 1; i < nslots; i++) {
-		bool hot = hist[i - 1].m.rt_core || hist[i].m.rt_core;
+	avail = rows - 2 - ev_rows;
 
-		for (int r = 2; r < 2 + ph; r++)
-			put_cell(r, i * (pw + gap) - 2, hot ? "┃" : "│",
-				 hot ? C_MAGENTA : C_DIM);
+	/*
+	 * Panels in a grid: as many columns as keep each panel at least
+	 * MIN_PANEL_W wide, as many rows as keep every selected chart at
+	 * least two rows tall.  What does not fit goes to further pages.
+	 */
+	need = 3 + charts_shown() * MIN_CHART_ROWS;
+	cpr = (cols + PANEL_GAP) / (MIN_PANEL_W + PANEL_GAP);
+	if (cpr < 1)
+		cpr = 1;
+	if (cpr > nslots)
+		cpr = nslots ? nslots : 1;
+	prow = avail / need;
+	if (prow < 1)
+		prow = 1;
+	if (prow > (nslots + cpr - 1) / cpr)
+		prow = (nslots + cpr - 1) / cpr;
+	per_page = cpr * prow;
+	pages = (nslots + per_page - 1) / per_page;
+	if (page >= pages)
+		page = pages - 1;
+	if (page < 0)
+		page = 0;
+	ph = avail / prow;
+	pw = (cols - PANEL_GAP * (cpr - 1)) / cpr;
+	first = page * per_page;
+	last = first + per_page < nslots ? first + per_page : nslots;
+	if (pages > 1)
+		snprintf(pg, sizeof(pg), "  cores %d-%d of %d, page %d/%d",
+			 first + 1, last, nslots, page + 1, pages);
+
+	/* title bar */
+	localtime_r(&wall, &tm);
+	snprintf(title, sizeof(title),
+		 " pmutop  %02d:%02d:%02d  %s  every %d ms%s%s%s%s",
+		 tm.tm_hour, tm.tm_min, tm.tm_sec, info.mode, info.interval_ms, pg,
+		 info.csv ? "  csv " : "", info.csv ? info.csv : "",
+		 paused ? "  [PAUSED]" : "");
+	for (i = 0; i < cols; i++)
+		put_cell(0, i, " ", A_REV);
+	put_text(0, 0, cols, title, A_REV | A_BOLD);
+	{
+		const char *keys = pages > 1 ? " q quit  p pause  c clear  \xe2\x86\x90\xe2\x86\x92 page "
+					     : " q quit  p pause  c clear ";
+		int kw = pages > 1 ? 37 : 26;
+
+		if (cols > (int)strlen(title) + kw)
+			put_text(0, cols - kw, kw, keys, A_REV);
+	}
+	put_text(1, 0, cols,
+		 " \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
+		 "   bar colour = range it was drawn on: green < light blue < blue < magenta;"
+		 " yellow/red = high/too high", C_DIM);
+
+	for (i = first; i < last; i++) {
+		int k = i - first, pr = k / cpr, pc = k % cpr;
+		int r0 = 2 + pr * ph, c0 = pc * (pw + PANEL_GAP);
+		int top = pr ? 1 : 0;	/* a rule above every panel row but the first */
+
+		if (top)
+			for (int x = c0; x < c0 + pw; x++)
+				put_cell(r0, x, "─", C_DIM);
+		draw_panel(&hist[i], r0 + top, c0, pw, ph - top);
+		/*
+		 * Divider to the left; the edges of an isolated core's panel
+		 * are heavy and magenta, so the real-time cores stand out.
+		 */
+		if (pc) {
+			bool hot = hist[i - 1].m.rt_core || hist[i].m.rt_core;
+
+			for (int r = r0 + top; r < r0 + ph; r++)
+				put_cell(r, c0 - 2, hot ? "┃" : "│",
+					 hot ? C_MAGENTA : C_DIM);
+		}
 	}
 
 	/* event log, newest first */
@@ -859,7 +919,8 @@ int ui_wait(int ms, int nslots)
 {
 	int64_t end = mono_ns() + (int64_t)ms * 1000000;
 	struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-	char ch;
+	char buf[32];
+	ssize_t n;
 
 	for (;;) {
 		int64_t left = (end - mono_ns()) / 1000000;
@@ -873,24 +934,47 @@ int ui_wait(int ms, int nslots)
 			}
 			continue;
 		}
-		if (read(STDIN_FILENO, &ch, 1) != 1)
-			continue;
-		switch (ch) {
-		case 'q':
-		case 'Q':
-			return 1;
-		case 'p':
-		case 'P':
-			paused = !paused;
-			ui_draw(nslots);
-			break;
-		case 'c':
-		case 'C':
-			nevents = 0;
-			ui_draw(nslots);
-			break;
-		default:
-			break;
+		n = read(STDIN_FILENO, buf, sizeof(buf));
+		for (ssize_t i = 0; i < n; i++) {
+			/*
+			 * Paging: Right / PgDn next, Left / PgUp previous.
+			 * Arrows arrive as ESC [ C / ESC [ D, PgUp / PgDn as
+			 * ESC [ 5 ~ / ESC [ 6 ~.  ui_draw() clamps the page.
+			 */
+			if (buf[i] == 27 && i + 2 < n && buf[i + 1] == '[') {
+				char k = buf[i + 2];
+
+				i += 2;
+				if (k == 'C')
+					page++;
+				else if (k == 'D')
+					page--;
+				else if ((k == '5' || k == '6') && i + 1 < n && buf[i + 1] == '~') {
+					page += k == '6' ? 1 : -1;
+					i++;
+				} else {
+					continue;
+				}
+				ui_draw(nslots);
+				continue;
+			}
+			switch (buf[i]) {
+			case 'q':
+			case 'Q':
+				return 1;
+			case 'p':
+			case 'P':
+				paused = !paused;
+				ui_draw(nslots);
+				break;
+			case 'c':
+			case 'C':
+				nevents = 0;
+				ui_draw(nslots);
+				break;
+			default:
+				break;
+			}
 		}
 	}
 }

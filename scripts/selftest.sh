@@ -8,7 +8,7 @@ busy() { while :; do :; done; }
 busy &
 P=$!
 echo "== busy loop, pid $P"
-./pmutop -p "$P" -i 300 -n 3
+./pmutop -b -p "$P" -i 300 -n 3
 kill "$P"
 
 # 256 MiB random walk: defeats the caches and the TLB.
@@ -35,5 +35,5 @@ cc -O2 -o /tmp/thrash /tmp/thrash.c || exit 1
 P=$!
 sleep 1
 echo "== memory thrash, pid $P"
-./pmutop -p "$P" -i 300 -n 3
+./pmutop -b -p "$P" -i 300 -n 3
 kill "$P"

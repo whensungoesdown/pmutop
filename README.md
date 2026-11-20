@@ -1,232 +1,274 @@
-# pmutop：逐核硬件计数器监测与瓶颈定位
+# pmutop
 
-pmutop 是一个类似 top 的逐核监测工具：用 CPU 的硬件性能计数器（PMU）实时显示每个核的使用率、IPC、L1I / L1D / L2 缓存未命中、iTLB / dTLB 未命中、缺页、频率和中断，帮助判断一个核的瓶颈在哪里，并在某个核偏离它自己的正常水平时告警。
+**A top-like, per-core view of CPU hardware performance counters, for finding what limits a core.**
 
-对从 Linux 隔离出来的实时核（`isolcpus`，例如 Xenomai 4 / EVL 系统），pmutop 另有专门支持：以硬件计数测量包含带外（EVL）线程在内的真实使用率，对实时核采用更严格的告警规则，并可读取实时任务自身上报的帧耗时，在实时环境即将过载时提前告警。本项目最初为此而写（原名 rt-health），下文的测试数据均来自 Xenomai 4 实机。
+pmutop reads each core's PMU (performance monitoring unit) through the Linux `perf_event_open()` interface and shows, live and per core:
 
-## 1. 设计依据
+- CPU usage measured by the hardware, and the average clock while awake
+- IPC (instructions per cycle)
+- L1 instruction, L1 data and L2 cache misses
+- instruction and data TLB misses
+- page faults, and interrupts by source
 
-### 1.1 预警需要两类信号
+From these you can usually tell whether a core is limited by memory, by instruction fetch, by address translation, by its clock, or by interrupts. pmutop also learns each core's normal level and warns when a core departs from it.
 
-- **事实信号**：实时任务自己报告的帧耗时与超周期次数。只有它能确定地说明“实时性已经受损”，因此只有它能把状态升为 FAIL；
-- **趋势信号**：缓存、TLB、IPC、停顿、中断等硬件统计。它们不直接说明超时，但通常在超时之前就开始变化，用于提前告警（WARN）。
+Cores isolated from the Linux scheduler (`isolcpus`), as used for real-time work such as **Xenomai 4 / EVL**, get extra support. Their usage figure includes out-of-band threads that Linux cannot see, they get stricter alarm rules, and a real-time task can report its own frame timing to pmutop.
 
-### 1.2 不看绝对值，看相对基线
+A capture from the reference machine, `--show ipc,cpu`, with an ordinary core (CPU 3) next to two isolated cores running a 1 ms real-time loop (CPU 4 and 5):
 
-缺失率的绝对值本身不能说明问题。顺序扫描大数组的程序，末级缓存（LLC）几乎每次访问都会未命中，但它照样能跑满内存带宽，效率并不低。所以 pmutop：
+```
+CPU 3    OK    CPU 0.0%  1784 MHz  48C            ┃ CPU 4    OK    CPU 2.4%  1574 MHz  48C    ISOLATED  ┃ CPU 5 ...  ISOLATED
+IRQ/s: timer 0  thermal 0  IPI 0  device 0        ┃ IRQ/s: timer 1011  thermal 0  IPI 0  device 0     ┃ ...
+▲ IPC 0.25                        higher = better ┃ ▲ IPC 0.75                       higher = better   ┃ ▲ IPC 0.84 ...
+     5│                                           ┃      5│                                            ┃      5│
+      │▅ ▄  ▆  ▅ ▆  ▆  ▆ ▆  ▆  ▆  ▆  ▆  ▆  ▇ ▄    ┃       │                                            ┃       │
+      │█ █  █  █ █  █  █ █  █  █  █  █  █  █ █    ┃       │▂▂▁▂▁▂▂▂▂▂▄▄▄▄▃          ▂▂▂▂▂▂▂▂▂▁▂▂▂       ┃       │▃▃▃▃▃▃▃▃▃▂▄▅▄▅▆
+     0│█▃█▄▂█▃▂█▃█▃▄█▃▃█▃█▃▃█▃▃█▂▂█▃▃█▃▃█▃▃█▂█    ┃      0│███████████████████████████████████████    ┃      0│███████████████▇▁▁▁▁▁▁▁▁▁▁▁▁▆█████
+```
 
-1. 把计数换算为**每千条指令的未命中数（MPKI）**，与任务的执行速度无关；
-2. 为每个核**学习自己的正常范围**：保留最近 120 个采样，以中位数和 MAD（中位数绝对偏差）估计基线和离散度；
-3. 当前值偏离基线超过 3.5 个稳健标准差，并超过一个绝对下限时，才告警。
+CPU 5's IPC collapses in the middle, while a cache-thrashing task runs there; on screen those bars turn yellow, then red.
 
-使用中位数和 MAD，而不是均值和标准差，是为了避免一次尖峰拉宽正常范围，导致之后再也不告警。
+## Contents
 
-### 1.3 监测本身不能干扰实时核
+1. [Quick start](#quick-start)
+2. [Options](#options)
+3. [The graphic view](#the-graphic-view)
+4. [Text and CSV output](#text-and-csv-output)
+5. [How pmutop measures](#how-pmutop-measures)
+6. [Hardware events](#hardware-events)
+7. [Warnings](#warnings)
+8. [Real-time and Xenomai support](#real-time-and-xenomai-support)
+9. [Reading the numbers: common bottlenecks](#reading-the-numbers-common-bottlenecks)
+10. [Requirements and limitations](#requirements-and-limitations)
+11. [Validation](#validation)
+12. [Source layout](#source-layout)
 
-- **只计数，不采样。** 在 Dovetail 内核上，PMU 溢出中断（PMI）通过 NMI 处理函数 `perf_event_nmi_handler()` 送达（`arch/x86/events/core.c`，注册为 `NMI_LOCAL`）。NMI 不受中断流水线管控，会直接打断实时线程。计数模式在读取之前不产生任何中断。
-- **与其他计数器用户共享。** 计数组不独占（非 pinned）：perf 或另一个 pmutop 同时使用计数器时，内核分时复用，pmutop 按“启用时间/实际计数时间”换算出整个周期的估计值；若独占，计数组会进入错误状态，此后读数一直为空。
-- **每个采样周期只发一次 IPI。** 读取一个处于活动状态的核级 perf 事件，要在该事件所属的核上完成：内核经 `perf_event_read()` → `smp_call_function_single()` 向被监测的核发送 IPI（`kernel/events/core.c`）；停止、启动事件也各需一次 IPI。pmutop 把全部事件放在一个组内，以 `PERF_FORMAT_GROUP` 对组长做一次 `read()` 取回所有值，每核每个采样周期只有一次 IPI。在 Dovetail 内核上这是一个带内中断：实时线程运行时它只被记入日志，等该核回到 Linux 时才执行，因此不会抢占实时线程，只付出一次流水线入口开销。
-- **监测进程运行在非实时核上**，用 `taskset` 绑定即可。
-
-## 2. 实时核过载的成因与对应指标
-
-| 成因 | 机理 | 主要指标 |
-|---|---|---|
-| 计算密度过高 | 单帧计算量接近帧周期，余量消失 | 帧耗时上升、超周期；利用率接近 100% |
-| 工作集超出缓存 | 每帧访问的数据超过 L2/LLC 容量，或多个实时任务的工作集相互挤出 | LLC MPKI 上升，IPC 下降 |
-| 共享 LLC 与内存带宽争用 | 非实时核上的负载占用共享 LLC 和内存带宽（“吵闹的邻居”）。实时核虽然隔离，硬件资源仍然共享 | 实时核的 LLC MPKI 和后端停顿上升，但其自身代码没有变化 |
-| 访问模式不友好 | 随机访问、跨步访问、指针追逐，使硬件预取失效 | LLC MPKI 和后端停顿上升 |
-| TLB 覆盖不足 | 工作集跨越的 4 KiB 页太多，超出 TLB 覆盖范围 | dTLB MPKI 上升。对策：hugetlbfs 大页 |
-| 远端 NUMA 内存 | 线程运行的节点与内存所在节点不同，访问延迟增加 | 只在多 NUMA 节点机器上存在；表现为后端停顿上升。可用 `numastat -p` 确认 |
-| 伪共享 | 两个核写同一缓存行，缓存行在核间来回传递 | 后端停顿上升，IPC 下降 |
-| 中断落到实时核 | 设备中断或 IPI 被分配到实时核 | 实时核上出现设备类中断（不需要基线，第一个采样即告警，并给出 IRQ 号与设备名）；IPI 频率异常 |
-| 降级到 Linux | 普通系统调用、缺页、信号使实时线程离开带外阶段 | 线程模式下的 context switch、page fault 计数（`-p`） |
-| 频率与温控 | 温控降频、调频策略被改回节能 | 实时核频率下降、温度上升 |
-| SMI | 固件的系统管理中断，所有核暂停 | 帧耗时偶发尖峰；需用 `rdmsr 0x34` 单独检查 |
-
-### 关于 NUMA 的说明
-
-远端 NUMA 内存只在**多个 NUMA 节点**的机器上才会出现（多路服务器，或开启了 SNC 等子 NUMA 划分的单路服务器）。本研究使用的笔记本（Intel Core Ultra 9 285H）只有一个 NUMA 节点，不存在远端内存。在多节点机器上，还要注意内核的 NUMA 自动均衡会改写锁定页的页表项、引发缺页并导致降级，应关闭它（`numa_balancing=disable`）。
-
-### 关于“缓存效率低”的说明
-
-缓存效率低不能简单地由未命中率判断，原因见 1.2 节。更可靠的判断方法是：同一个任务的 MPKI 相对于它自己的基线上升，**同时** IPC 下降，**而且**帧耗时随之增加。只有三者同时出现，才能确认是缓存问题拖慢了任务。
-
-## 3. 编译与使用
+## Quick start
 
 ```
 make
-sudo ./pmutop                 # 默认监测 /sys/devices/system/cpu/isolated 中的核
-sudo ./pmutop -c 4,5 -i 1000 -o rt.csv
-sudo ./pmutop -p <tid>        # 跟踪一个实时线程，同时报告降级相关的软件事件
-./pmutop -c 4 -t /dev/shm/rt-telemetry.bin   # 读取实时任务上报的帧数据
+sudo ./pmutop                         # every core, every chart, full-screen
+sudo ./pmutop -c 0-3 -s cpu,ipc,l2    # cores 0-3, three charts
+sudo ./pmutop -c isolated             # only the cores isolated with isolcpus=
+sudo ./pmutop -b -n 10 -o run.csv     # 10 text samples, also recorded to CSV
+sudo ./pmutop -p <tid>                # follow one thread instead of cores
+make check                            # unit test
 ```
 
-| 选项 | 含义 |
+With no options, pmutop watches every online core and shows every chart in the full-screen view. When its output is not a terminal (piped or redirected), it prints text lines instead.
+
+Run pmutop on a core you are not watching closely, for example `sudo taskset -c 0 ./pmutop ...`, so that it does not add load to the cores it measures.
+
+## Options
+
+```
+What to watch:
+  -c, --cpus=LIST        cores: all, isolated, or a list such as 0,2,4-7
+                         (default: all)
+  -p, --pid=TID          follow one thread instead of cores
+
+How to show it:
+  -g, --graphic          full-screen charts (default on a terminal)
+  -b, --batch            one text line per core per sample
+  -s, --show=LIST        charts in the full-screen view, in this order
+                         (default: all): cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb,frame
+  -i, --interval=MS      sampling interval in milliseconds (default 1000)
+  -n, --count=N          stop after N samples (default: until q or Ctrl-C)
+  -o, --csv=FILE         also write every sample to FILE
+
+Real-time tasks:
+  -t, --telemetry=FILE   frame timing published by a real-time task
+
+Hardware events (raw code per core type: PMU:CONFIG[:CONFIG1][,...];
+built in for Intel Core Ultra 200H):
+      --l1i-event=SPEC   L1 instruction-cache misses
+      --l1d-event=SPEC   L1 data-cache misses
+      --l2-event=SPEC    L2 cache misses
+
+  -h, --help             show this help
+  -V, --version          show the version
+```
+
+Notes:
+
+- `--cpus` and `--pid` are mutually exclusive, as are `--graphic` and `--batch`. Offline or unknown CPUs are rejected rather than shown as empty panels.
+- `--interval` accepts 10 ms to 1 hour.
+- `--graphic` given explicitly without a terminal is an error. Use `--batch`.
+- The `frame` chart appears only when `--telemetry` is given (see [Frame telemetry](#frame-telemetry)).
+- Chart keys for `--show`: `cpu` CPU usage, `ipc` IPC, `pf` page faults, `l1i` / `l1d` / `l2` cache misses, `itlb` / `dtlb` TLB misses, `frame` worst frame time.
+
+## The graphic view
+
+```
+sudo taskset -c 0 ./pmutop -i 500
+```
+
+Each core gets a panel. Within a panel, each metric is a scrolling bar chart several rows tall, with one bar per sample and the newest on the right.
+
+**Layout and pages.** Panels are laid out in a grid. There are as many columns as keep each panel at least 44 characters wide, and as many rows as keep every selected chart at least two rows tall. Cores that do not fit go to further pages. The title bar then shows, for example, `cores 5-8 of 16, page 2/4`. On a 200×50 terminal, 16 cores with all 8 charts take 4 pages of 4 cores. Show fewer charts (`-s`) or fewer cores (`-c`) to fit more on one page.
+
+- **▲ grows up, higher is better:** IPC (fixed range 0–5).
+- **■ grows up, neutral:** CPU usage (0–100 %).
+- **▼ hangs down from the top, lower is better:** page faults, L1I, L1D and L2 misses, iTLB and dTLB misses, and worst frame time when `-t` is used.
+- **Panel header:** state (OK / WARN / FAIL), CPU usage, measured clock, temperature, interrupts per second by source, and the reason when the state is not OK.
+- **Isolated cores** are marked with a magenta `ISOLATED` tag, a magenta core number and heavy magenta dividers.
+- **Event log** (bottom): state changes with time and reason, newest first.
+- **Keys:** `q` quit, `p` pause the display (sampling and learning continue), `c` clear the event log, ← / → or PgUp / PgDn change page.
+
+If even a single panel does not fit in the terminal, fewer charts are shown, most important first. A UTF-8 terminal is required.
+
+### Automatic ranges and colours
+
+All rate charts are **counts per second on a linear scale**. Each has four ranges:
+
+| Chart | Ranges |
 |---|---|
-| `-c 4,5` / `-c 4-7` / `-c all` | 监测的核，默认取隔离核 |
-| `-p tid` | 跟踪一个线程，替代 `-c` |
-| `-i ms` | 采样间隔，默认 1000 ms |
-| `-n count` | 采样次数，默认一直运行 |
-| `-o file.csv` | 同时输出 CSV |
-| `-t file` | 实时任务的帧遥测共享文件 |
-| `-graphic`（或 `-g`、`--graphic`） | 全屏图形界面，见下文 |
-| `--show LIST` | 图形界面显示哪些图表及其顺序，逗号分隔：`frame,cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb`，或 `all`（默认）。例如 `--show cpu,l1d,l2` |
-| `--l2-event` / `--l1d-event` / `--l1i-event PMU:编码[:编码1][,…]` | L2 / L1D / L1I 未命中的原始事件，按核心类型指定（Core Ultra 200H 内置）；`编码1` 写入 `config1`，例如 P 核 L1I 的 frontend 选择字段 |
+| page fault/s | 200, 2k, 20k, 200k |
+| L1I miss/s | 10k, 100k, 1M, 10M |
+| L1D miss/s | 50k, 500k, 5M, 50M |
+| L2 miss/s | 10k, 100k, 1M, 20M |
+| iTLB miss/s | 5k, 50k, 500k, 5M |
+| dTLB miss/s | 1k, 10k, 1M, 20M |
 
-建议把监测进程绑定到非实时核：`taskset -c 0 sudo ./pmutop ...`。
+Each sample is drawn on the smallest range that covers the last 10 samples. The range steps up at once and steps down after 10 quiet samples, so it does not flicker. Bars are never rescaled after they are drawn. Each bar is coloured by the range it was drawn on: **green → light blue → blue → magenta**, from smallest to largest. A light-blue bar of the same height as a green one therefore means ten times as much. The title line lists the ranges, with the current one in brackets, for example `range:  10k [100k] 1M  20M`. A value beyond the largest range is drawn as a full bar ending in `+`.
 
-### 图形界面（-graphic）
+**Value bands** override the range colour where a high value is a fault:
 
-```
-sudo taskset -c 0 ./pmutop -c 4,5 -i 500 -graphic
-```
-
-类似 htop 的全屏界面。被监测的核**横向并排**，每核一列；每列内各项指标**纵向排列**，每项是一个数行高的滚动柱状图，每个采样一根柱，最新的在最右：
-
-- **▼ 向下生长（从顶部垂下）：越低越好**：缺页/s、L1I 未命中/s、L1D 未命中/s、L2 未命中/s、iTLB 未命中/s、dTLB 未命中/s，使用 `-t` 时还有最坏帧耗时。中断不再单独作图，各类中断的每秒次数仍显示在面板头部，设备中断落到实时核时仍会告警。所有速率均为**每秒次数、线性刻度**，超出刻度的采样画满并在末端标 `+`；
-- **▲ 向上生长：越高越好**：IPC（每周期指令数），固定刻度 0–5；所有核同一套颜色：正常为绿色、低于 0.5 黄色、低于 0.2 红色（pingpong 约 0.7–0.9，随机指针追逐 0.03）。空闲核只执行几百条指令，IPC 没有意义；
-- **隔离核标记**：从 Linux 隔离出来的核（`/sys/devices/system/cpu/isolated`）在面板标题处以品红色反显标注 `ISOLATED`，核号为品红色，面板两侧的分隔线加粗为品红色；
-- **■ CPU 忙碌率**：向上生长，本身无好坏；
-- **颜色**：每根柱按其数值所在的区间着色，绿色正常、黄色偏高、红色过高。核的状态（OK/WARN/FAIL）在面板头部和事件栏中显示。各指标的分界：
-
-  | 指标 | 刻度 | 黄色 | 红色 | 实测参考（ThinkBook） |
-  |---|---|---|---|---|
-  | CPU 忙碌率 | 0–100% | > 70% | > 90% | pingpong 2–3% |
-  | 缺页/s | 0–200 | > 0 | > 100 | pingpong 0 |
-  | L1I 未命中/s | 0–10k | > 20k | > 100k | pingpong 约 3.6–5.5k；其他核运行内存密集负载时约 45k；空闲约 200 |
-  | L1D 未命中/s | 0–50k | > 200k | > 1M | pingpong 约 34k；空闲约 450；随机指针追逐 3.3M |
-  | L2 未命中/s | 0–100k | > 50k | > 100k | pingpong 约 30–42k；随机指针追逐数百万 |
-  | iTLB 未命中/s | 0–5k | > 10k | > 50k | pingpong 约 2.4–2.6k；空闲 8 |
-  | dTLB 未命中/s | 0–10k | > 1000 | > 5000 | pingpong 约 20–60 |
-  | 最坏帧耗时 | 0–1000 µs | > 500 µs | > 900 µs | — |
-
-  **自动量程。** 各速率图表（缺页、L1I、L1D、L2、iTLB、dTLB）有 4 档量程，每个新采样落在能覆盖最近 10 个采样的最小一档：数值上升时立即换大一档，安静 10 个采样后再降回。已画出的柱不重新缩放，每根柱保留它采样时的量程，并以量程着色：**绿色 → 浅蓝 → 蓝 → 品红**，从小到大。同样高度的浅蓝柱代表的数值是绿柱的 10 倍。标题行右侧列出全部量程，当前一档加方括号。
-
-  | 图表 | 4 档量程 |
-  |---|---|
-  | 缺页/s | 200、2k、20k、200k |
-  | L1I 未命中/s | 10k、100k、1M、10M |
-  | L1D 未命中/s | 50k、500k、5M、50M |
-  | L2 未命中/s | 10k、100k、1M、20M |
-  | iTLB 未命中/s | 5k、50k、500k、5M |
-  | dTLB 未命中/s | 1k、10k、1M、20M |
-
-  **红色**仍表示“过高”（上表的红色界限），只在隔离的实时核上使用，并优先于量程颜色；普通核上的高值不是故障，只显示量程颜色。CPU 使用率不分档，在所有核上按 70% / 90% 着黄、红色；IPC 同样在所有核上着色。
-
-  每秒次数会随核的工作量一起增加，同样的代码做两倍的工作，未命中次数也翻倍。判断缓存是否“用得差”的告警规则仍使用每千条指令的未命中数（文本输出与 CSV 中的 `*_mpki` 列），不受此影响。
-
-- **刻度固定**，同样高度始终代表同样的值，左侧标出起点和终点的刻度值；
-- **面板头部**：状态、忙碌率（同时给出 Linux 看到的利用率作对比）、频率、温度、各类中断的每秒次数，WARN/FAIL 时给出原因；
-- **事件栏**（底部）：状态变化的时间和原因，最新的在上，原因类型不变时不重复记录；
-- **按键**：`q` 退出，`p` 暂停刷新（采样和基线学习继续），`c` 清空事件栏。
-
-终端行数不够时，按重要性减少每核显示的图表。需要 UTF-8 终端。`-o` 可以同时使用。
-
-### 实时核频率偏低：C1E
-
-实时核以 1 ms 周期唤醒时，测得的平均频率只有约 1.5–1.6 GHz，而 `rt-power` 已把频率固定为 2.9 GHz。排查结果（ThinkBook）：
-
-| 条件 | 非空闲期间平均频率 | 降频时间 |
-|---|---:|---|
-| 单线程持续 100% 负载（CPU 4） | 2.89 GHz | — |
-| evl-pingpong，允许 POLL + C1（当前配置） | 1.58 GHz | 0 ms（封装温度 49 °C） |
-| 同上，另 14 核满载（92 °C） | 1.58 GHz | 0 ms |
-| evl-pingpong，CPU 4 只允许 POLL | 2.87 GHz | — |
-
-结论：不是温控降频（`package_throttle_total_time_ms` 不增长），也不是 `rt-power` 失效（min = max = 2.9 GHz 仍在）。原因是 **C1E**：`MSR_POWER_CTL`（0x1FC）= 0x8e8005f，第 1 位（C1E 使能）为 1。核心进入 C1 时被自动提升为 C1E 并降低电压和频率，每次唤醒后的一段时间内以低频运行。实时线程每次只运行十几微秒，大部分执行时间都处在这段低频期内。
-
-处理办法（尚未应用，待决定）：在 BIOS 中关闭 C1E，或清除 MSR 0x1FC 第 1 位（`wrmsr`，每次开机需重新设置），或在实时核上只保留 POLL（功耗最高，核心一直忙等）。
-
-### CPU 使用率（cpu%）
-
-`/proc/stat` 是 Linux 自己的统计，看不到带外（EVL）线程的执行时间：运行 evl-pingpong 的核上它显示 0%。pmutop 改用硬件计数：核心非空闲时的参考周期数（`ref-cycles`，x86 上以 TSC 频率计数，停机时不计数）除以“参考频率 × 采样间隔”。参考频率在启动时用一次 0.2 s 的自测量标定。
-
-实机核对（ThinkBook，CPU 4、5）：
-
-| 负载 | busy% | Linux 看到的利用率 | 预期 |
-|---|---:|---:|---|
-| 空闲 | 0.6–0.7 | 0.0 | 约 0（仅定时器） |
-| evl-pingpong | 2.3–3.0 | 0.0 | ≥ 1.6（A 线程每 1 ms 忙碌约 16 µs，加中断与切换开销） |
-| 占空比 50% 的 Linux 任务 | 55.8 | 50.5 | 约 50，加该任务自身的定时唤醒 |
-
-基线学习只接受 busy% > 1.5% 的采样（空闲核 0.6–0.7%，运行 pingpong 的核 2–3%）。此前按 Linux 利用率 > 3% 判断，只运行 EVL 线程的核永远不会被当作“忙碌”，缓存与 IPC 检查在这些核上实际从未生效；改用 busy% 后已修正。
-
-### L2 未命中（--l2-event）
-
-图表中的缓存指标是 **L2** 数据读未命中，而不是 L3（LLC）。CPU 4、5 的 L2（各 3 MiB）为本核私有，L2 未命中反映的是本核自身工作集的变化；L3（24 MiB）由 CPU 0–13 共享，其未命中还受其他核挤占的影响。
-
-perf 没有通用的 L2 事件，需要处理器型号专用的原始事件。内核不在 sysfs 中公布这些编码（它们在 perf 工具自带的 JSON 表中），因此：
-
-- 混合架构的每种核心有自己的 PMU 和事件编码，pmutop 按核选用。本研究平台（Intel family 6 model 197，Core Ultra 200H）内置：
-
-  | 核心 | PMU | 事件 | 编码 |
-  |---|---|---|---|
-  | P 核 CPU 0–5 | `cpu_core` | `L2_RQSTS.DEMAND_DATA_RD_MISS`（L2 数据读请求未命中） | `0x2124` |
-  | E 核 CPU 6–13 | `cpu_atom` | `MEM_LOAD_UOPS_RETIRED.L2_MISS`（退休的 load 中 L2 未命中的条数） | `0x80d1` |
-  | LP E 核 CPU 14–15 | `cpu_lowpower` | 同 E 核编码（perf 没有该 PMU 的事件表，与 E 核同一微架构） | `0x80d1` |
-
-  编码来自 `perf list --details`。P 核与 E 核的事件含义接近但不相同，跨核类型比较时应注意；
-- 其他处理器用 `--l2-event PMU:编码[,PMU:编码]` 指定，编码可用 `perf list --details` 查到；
-- 没有对应事件的核只是不显示 L2，其他核与其他指标照常。
-
-  实测核对（同一时刻，各核运行 512 MiB 随机指针追逐，单位：每千条指令未命中）：P 核 CPU 3：pmutop 16.20 / perf 16.57；E 核 CPU 7：16.67 / 16.24；LP E 核 CPU 14：26.92 / 26.96。
-
-实机数据（CPU 4，单位：每千条指令未命中数）：
-
-| 负载 | L2/K | L3(LLC)/K |
-|---|---:|---:|
-| 空闲（每秒只有约 1000 次定时器唤醒，见下注） | 9.3–9.9 | 2.0–2.4 |
-| evl-pingpong | 1.24 | 0.006 |
-| 64 KiB 顺序读（装得进 L2） | 0.10 | 0.013 |
-| 512 MiB 随机指针追逐 | 85.4（perf 同时测得 84.9） | 约 71 |
-
-注：空闲核执行的指令极少，而每次唤醒都要重新取回被挤出的数据，比值因此偏高，没有诊断意义；告警只使用忙碌（busy% > 1.5%）的采样。
-
-L3 的数值仍保留在文本输出和 CSV 中（`llc_mpki`），告警规则目前仍以 L3 为准。
-
-### L1 与 iTLB 事件
-
-| 图表 | P 核（`cpu_core`） | E 核与 LP E 核（`cpu_atom`、`cpu_lowpower`） | 来源 |
+| Chart | Yellow | Red | Applies to |
 |---|---|---|---|
-| L1D 未命中 | `MEM_LOAD_RETIRED.L1_MISS`，0x08d1 | `MEM_LOAD_UOPS_RETIRED.L1_MISS`，0x40d1 | 原始事件，`--l1d-event` 可改 |
-| L1I 未命中 | `FRONTEND_RETIRED.L1I_MISS`，0x03c6，frontend 0x12（config1） | `FRONTEND_RETIRED.ICACHE`，0x20c6 | 原始事件，`--l1i-event` 可改 |
-| iTLB 未命中 | 通用事件 → `ITLB_MISSES.WALK_COMPLETED`（0xe11） | 通用事件 → `ITLB.MISS`（0x0481） | 同上 |
+| CPU usage % | > 70 | > 90 | all cores |
+| IPC | < 0.5 | < 0.2 | all cores |
+| page fault/s | > 0 | > 100 | isolated cores |
+| L1I miss/s | > 20k | > 100k | isolated cores |
+| L1D miss/s | > 200k | > 1M | isolated cores |
+| L2 miss/s | > 50k | > 100k | isolated cores |
+| iTLB miss/s | > 10k | > 50k | isolated cores |
+| dTLB miss/s | > 1k | > 5k | isolated cores |
+| worst frame µs | > 500 | > 900 | isolated cores (1 ms period) |
 
-- 内核在 E 核上没有映射通用的 L1D 未命中事件（表中为 0），因此 L1D 用原始事件。P 核与 E 核选用的都是“退休的 load 中 L1D 未命中的条数”，两类核测的是同一件事；
-- L1I 在两种核心上都计“退休指令中取指时遇到 L1I 未命中的条数”，不含预取与错误路径取指，反映真正影响执行的未命中。早先 P 核用的通用事件 `L2_RQSTS.ALL_CODE_RD` 计的是送往 L2 的全部取指请求（含预取），数值是真实未命中的 5–8 倍，且其他核运行重负载时会明显上升，而真实未命中与 IPC 基本不变；
-- P 核 L1I 事件需要额外的 frontend 选择字段（`cpu_core/format/frontend` 为 `config1:0-23`），因此事件编码格式扩展为 `PMU:config:config1`；
-- 实测核对（同一时刻，512 MiB 随机指针追逐，每千条指令）：P 核 CPU 3 L1D 71.7 / perf 72.7，iTLB 0.96 / 0.92；E 核 CPU 7 L1D 103.6 / 106.2，iTLB 0.66 / 0.71。
+On ordinary cores, high miss rates usually just mean a busy, memory-hungry workload, so those charts show only the range colour. The bands for isolated cores were set from measurements of a 1 ms periodic real-time loop on the reference machine. Adjust them in `src/ui.c` for other workloads.
 
-**计数器容量。** 一个计数组必须能同时放进核心的硬件计数器，否则内核根本不调度它，组内所有事件都读不到数（perf 显示 `<not counted>`）。实测 P 核放不下 10 个可编程事件；为此去掉了不用的三个“访问次数”事件（cache-references、LLC-loads、dTLB-loads），现在 P 核与 E 核都是 7 个可编程事件加固定计数器，均能调度。若某核的计数组始终未被调度，pmutop 会提示一次 `counter group not scheduled`。
+Counts per second also grow when a core simply does more work. To judge whether the cache is being used badly, look at misses per 1000 instructions instead, as the warnings and the `*_mpki` CSV columns do.
 
-### 输出列
+## Text and CSV output
 
-| 列 | 含义 |
+With `--batch`, or when the output is not a terminal, pmutop prints one line per core per sample:
+
+| Column | Meaning |
 |---|---|
-| state | OK / WARN（趋势信号偏离基线）/ FAIL（实时任务报告超周期） |
-| cpu% | CPU 使用率：硬件测得（非空闲参考周期），包含 EVL 线程；没有 PMU 时才退回 Linux 的 `/proc/stat`（它看不到 EVL，在实时核上恒为 0） |
-| MHz | 核在非空闲期间的实际平均频率：非空闲核心周期 / 非空闲参考周期 × 参考频率。不使用 `scaling_cur_freq`，它在隔离的无节拍核上只在 Linux 节拍时刷新，不可靠 |
-| IPC | 每周期指令数 |
-| LLC/K、dTLB/K、cache/K | 每千条指令的 LLC 读未命中、dTLB 读未命中、缓存未命中 |
-| stall% | 后端停顿周期占比（许多 Intel 处理器不提供这一通用事件，显示为 -） |
-| IRQ/s | 该核每秒收到的中断数 |
+| `state` | OK, WARN (a signal departed from the core's normal level), FAIL (the real-time task reported a missed deadline) |
+| `cpu%` | CPU usage from the hardware (see [below](#cpu-usage)); Linux's `/proc/stat` figure only when no PMU is available |
+| `MHz` | Average clock while the core was awake, measured |
+| `IPC` | Instructions per cycle |
+| `LLC/K`, `dTLB/K`, `cache/K` | Last-level-cache, dTLB and all-cache misses per 1000 instructions |
+| `stall%` | Back-end stall cycles; `-` where the CPU has no generic event for it (most Intel cores) |
+| `IRQ/s` | Interrupts per second on this core |
+| `temp` | Temperature, °C (package sensor) |
+| `note` | Reason for a warning; in thread mode, context switches, page faults and migrations |
 
-### 权限与环境
+The CSV (`-o`) has one row per core per sample with these columns:
 
-- 核级计数需要 root，或 `perf_event_paranoid` ≤ 0；
-- 非 root 且 `perf_event_paranoid` = 2 时，只能计数自己的进程，并且只计用户态。pmutop 会自动降级到这一模式；
-- 虚拟机（包括 WSL2）通常不提供硬件 PMU。此时 pmutop 只用软件事件，缓存与 TLB 列显示为 -；
-- 混合架构处理器（如 Core Ultra）的 P 核和 E 核有不同的 PMU（`cpu_core`、`cpu_atom`）。本程序使用通用事件，由内核按核类型映射。
+`t_s, cpu, state, util, ipc, llc_mpki, dtlb_mpki, cache_mpki, stall_pct, irq_rate, irq_timer, irq_thermal, irq_ipi, irq_device, freq_mhz, temp_c, busy, page_faults, l2_mpki, l1d_mpki, l1i_mpki, itlb_mpki`
 
-## 4. 实时任务接入帧遥测
+`util` is Linux's figure and `busy` the hardware one, both 0–1. `*_mpki` are misses per 1000 instructions. The `irq_*` class columns are counts per interval, not per second.
 
-帧遥测是事实信号的来源。实时任务每帧调用一次 `rft_publish()`，只有普通内存写和一次原子写，不进入内核，不会降级（`telemetry/rt_frames.h`）：
+## How pmutop measures
+
+### Counting, never sampling
+
+pmutop opens counting events only, never sampling events. A counting event raises no interrupts until it is read. A sampling event raises a PMU interrupt (on x86, an NMI) on the watched core at every overflow.
+
+### One read per core per interval
+
+All events of a core are in one group and are read with a single `read()` of the group leader (`PERF_FORMAT_GROUP`). Reading a CPU-wide event is done on the core that owns it, through an inter-processor interrupt (`perf_event_read()` → `smp_call_function_single()` in `kernel/events/core.c`). So each watched core receives exactly one IPI per interval, however many events are counted.
+
+### Sharing the counters
+
+Groups are not pinned. If another user (perf, a second pmutop) also needs the counters, the kernel time-shares them, and pmutop scales each value by enabled time / running time to estimate the whole interval. A pinned group would instead go into an error state and read zero from then on.
+
+A group must also fit in the core's counters, or the kernel never schedules it and every event reads nothing. pmutop keeps its group at 7 programmable events plus the fixed counters, which fits on all core types of the reference CPU. If a group is never scheduled, pmutop says so once (`counter group not scheduled`) rather than showing zeros.
+
+### CPU usage
+
+pmutop measures usage as non-idle reference cycles (`ref-cycles`, which run at the TSC rate and stop when the core halts), divided by reference rate × interval. The reference rate is calibrated at start-up with a 0.2 s self-measurement.
+
+This differs from Linux's `/proc/stat` in one important case. On a core running Xenomai out-of-band threads, Linux sees itself idle and reports about 0 %, while the hardware figure shows the real load. On ordinary cores the two agree: a Linux task running 50 % of the time measured 55.8 % (hardware) against 50.5 % (`/proc/stat`), the difference being the task's own wake-ups.
+
+### Clock speed
+
+`MHz` is non-idle core cycles / non-idle reference cycles × reference rate: the core's average clock while it was actually running. `scaling_cur_freq` is not used. On a tickless isolated core it is refreshed only on the Linux tick and can be far off.
+
+### Learning what is normal
+
+A raw miss count says little on its own. A program streaming through a large array misses the last-level cache on almost every access, yet runs at full memory bandwidth. So for warnings pmutop:
+
+1. converts counts to **misses per 1000 instructions (MPKI)**, which does not depend on how fast the core runs;
+2. keeps each core's last 120 **busy** samples (usage > 1.5 %) and estimates its normal level and spread with the median and the median absolute deviation (MAD);
+3. warns when a value is more than 3.5 robust standard deviations from that level and above an absolute floor.
+
+The median and MAD are used instead of mean and standard deviation, so a single spike cannot widen the normal band. The spread is never taken below 5 % of the median, so a very steady workload does not turn every wobble into an alarm. Idle samples are ignored: an idle core runs a few hundred instructions per interval, and its MPKI and IPC mean nothing.
+
+A warning reads, for example, `LLC MPKI 7.47 (z+5.2, base 0.36)`. The value is 7.47, the core's normal level is 0.36, and the value is 5.2 spreads above normal.
+
+## Hardware events
+
+Generic perf events cover cycles, instructions, last-level cache, dTLB and iTLB. L1 and L2 misses need model-specific raw events, and on hybrid CPUs each core type has its own PMU and its own codes. The kernel does not publish these codes in sysfs; they come from `perf list --details`. pmutop has them built in for **Intel Core Ultra 200H** (family 6, model 197):
+
+| Metric | P-cores (`cpu_core`) | E-cores and LP E-cores (`cpu_atom`, `cpu_lowpower`) |
+|---|---|---|
+| L2 miss | `L2_RQSTS.DEMAND_DATA_RD_MISS` 0x2124 | `MEM_LOAD_UOPS_RETIRED.L2_MISS` 0x80d1 |
+| L1D miss | `MEM_LOAD_RETIRED.L1_MISS` 0x08d1 | `MEM_LOAD_UOPS_RETIRED.L1_MISS` 0x40d1 |
+| L1I miss | `FRONTEND_RETIRED.L1I_MISS` 0x03c6, frontend 0x12 (config1) | `FRONTEND_RETIRED.ICACHE` 0x20c6 |
+| iTLB miss | generic → `ITLB_MISSES.WALK_COMPLETED` | generic → `ITLB.MISS` |
+| dTLB miss | generic | generic |
+
+Notes:
+
+- **L1D and L1I count retired instructions.** L1D counts loads that missed L1D; L1I counts instructions fetched after an L1I miss. Prefetches and wrong-path fetches are excluded, so these are the misses that actually affect execution, and P- and E-cores measure the same thing. The generic P-core L1I event (`L2_RQSTS.ALL_CODE_RD`) counts every code request sent to L2, including prefetches. That read 5–8× the real misses and was not used.
+- **L2 differs slightly between core types.** On P-cores the event counts demand data-read requests that missed L2, on E-cores retired loads that missed L2. Compare P- and E-core L2 numbers with care.
+- **LP E-cores** have no event table in perf; they share the E-core design, and the E-core codes are used.
+- **Other CPUs.** Give the codes with `--l2-event`, `--l1d-event` and `--l1i-event`, one `PMU:config[:config1]` per core type, for example `--l1i-event cpu_core:0x03c6:0x12,cpu_atom:0x20c6`. To find a code, run `perf stat -vv -e <pmu>/<event-name>/` and read the `config` (and `config1`) values. A core whose type has no code shows no data for that chart; everything else still works.
+
+## Warnings
+
+| Level | Condition | Needs a learned baseline |
+|---|---|---|
+| FAIL | The real-time task reports a missed deadline through frame telemetry | no |
+| WARN | A device interrupt arrives on an **isolated** core; more than 5000 IPIs/s on an isolated core | no: a configuration error, reported from the first sample |
+| WARN | LLC MPKI, dTLB MPKI, IPC or back-end stalls depart from the core's normal level by more than 3.5 spreads | yes: 30 busy samples |
+| WARN | Thermal-event interrupts above 3000/s | yes |
+
+Interrupts are counted by source from `/proc/interrupts`:
+
+- **timer:** the local timer, plus on Xenomai kernels the out-of-band APIC timer and the Linux proxy tick;
+- **thermal:** `TRM`;
+- **IPI:** reschedule, function-call and TLB-shootdown interrupts;
+- **device:** numbered device interrupts.
+
+On ordinary cores, device interrupts are normal and never trigger a warning.
+
+## Real-time and Xenomai support
+
+### Isolated cores
+
+Cores in `/sys/devices/system/cpu/isolated` are treated as real-time cores. They are marked in the graphic view, coloured by the value bands, and checked for device interrupts and IPI storms.
+
+### Usage that includes out-of-band threads
+
+On a Xenomai 4 (EVL) or similar dual-kernel system, real-time threads run outside Linux's view, so `top`, `mpstat` and `/proc/stat` show their cores as idle. pmutop's hardware-based usage counts them. On the reference machine, a 1 ms periodic real-time loop on an isolated core measured 2.0–3.0 % usage with pmutop, while Linux reported 0.0 %.
+
+### Following a thread
+
+`-p tid` follows one thread wherever it runs. Along with the hardware counters it reports context switches, page faults and core migrations. On Xenomai, a context switch or page fault in a real-time thread usually means it left the real-time domain (it was "demoted" to Linux).
+
+### Frame telemetry
+
+A real-time task can publish its own frame timing, so that a missed deadline raises FAIL. This is a fact, not a statistical estimate. Publishing costs a few plain stores and one atomic store per frame, with no system call, so the real-time thread is not demoted (`telemetry/rt_frames.h`):
 
 ```c
 #include "rt_frames.h"
 
-/* 初始化期（Linux 态） */
+/* at initialisation (may use Linux services) */
 int fd = open("/dev/shm/rt-telemetry.bin", O_RDWR | O_CREAT, 0644);
 ftruncate(fd, sizeof(struct rft_page));
 struct rft_page *pg = mmap(NULL, sizeof(*pg), PROT_READ | PROT_WRITE,
@@ -238,83 +280,90 @@ struct rft_task *me = &pg->task[0];
 me->cpu = 4;
 me->period_ns = 1000000;
 
-/* 实时循环中，每帧结束时 */
+/* in the real-time loop, at the end of each frame */
 struct rft_frame f = {
-	.seq = k, .t_start = tk, .t_wake = r->wake,
-	.t_end = now_ns(), .deadline = tk + period,
-	.flags = overrun ? RFT_F_OVERRUN : 0,
+	.seq = k, .t_start = start, .t_wake = woke,
+	.t_end = now_ns(), .deadline = start + period,
+	.flags = late ? RFT_F_OVERRUN : 0,
 };
 rft_publish(me, &f);
 ```
 
-pmutop 以只读方式映射该文件，用顺序号前后两次读取的方法检测读到一半的记录，不会向共享页写入任何内容。
+Then run `sudo ./pmutop -c 4 -t /dev/shm/rt-telemetry.bin`; the `frame` chart then appears. pmutop maps the file read-only and detects torn records with a sequence number read before and after, so it never writes to the shared page. `scripts/mock_rt.c` is a stand-in producer that needs no real-time kernel and misses every 100th deadline on purpose.
 
-`scripts/mock_rt.c` 是一个不依赖 EVL 的模拟生产者，每 100 帧故意超时一次，用于测试监测程序。
+### Monitoring overhead on real-time cores
 
-## 5. 验证情况
+On a Xenomai kernel, the one IPI per interval used to read the counters is an in-band interrupt. While a real-time thread runs it is only logged, and it is handled when the core returns to Linux, so it never pre-empts the real-time thread. In two 60 s runs each of a 1 ms periodic real-time loop on isolated cores, wake-up latency was the same within run-to-run variation with no monitor, with a 1000 ms interval and with a 100 ms interval (average 1.7–2.3 µs, worst 11.6–18.4 µs). Smaller effects would need longer runs to resolve.
 
-### 5.1 告警规则
+## Reading the numbers: common bottlenecks
 
-| 级别 | 条件 | 是否需要基线 |
+| Cause | Mechanism | What to look for |
 |---|---|---|
-| FAIL | 实时任务通过帧遥测报告超周期 | 否 |
-| WARN | 隔离核（`/sys/devices/system/cpu/isolated`）上出现设备类中断；IPI 超过 5000 次/秒 | 否，属于配置错误，第一个采样即告警；普通核上设备中断是正常的，不告警 |
-| WARN | LLC MPKI、dTLB MPKI、IPC、后端停顿偏离本核基线 3.5 个稳健标准差以上 | 是，需 30 个忙碌采样（空闲采样不计入预热） |
-| WARN | 温度事件中断超过 3000 次/秒 | 是 |
+| Not enough compute time | Work per frame or request approaches the time available | CPU usage near 100 %, frame time rising |
+| Working set larger than the cache | Data no longer fits in L1/L2/L3 | L1D/L2 misses up, IPC down |
+| Shared-cache and memory-bandwidth contention | Other cores' load evicts this core's data from the shared L3 and saturates DRAM | This core's L2 and L1I misses rise although its own code did not change |
+| Unfriendly access pattern | Random or strided access, pointer chasing; the prefetchers cannot help | L1D/L2 misses and dTLB misses up, IPC very low |
+| TLB reach exceeded | The working set spans too many 4 KiB pages | dTLB misses up; consider huge pages (hugetlbfs) |
+| Large or scattered code | Code does not fit in L1I, or jumps across many pages | L1I and iTLB misses up |
+| False sharing | Two cores write the same cache line | IPC down without a rise in capacity misses |
+| Interrupts on the wrong core | Device interrupts or IPIs land on a core meant to be quiet | Device IRQ/s and IPI/s in the panel header |
+| Page faults | Memory touched for the first time, or swapped out | page fault/s; on real-time threads, a demotion to Linux |
+| Clock and power | Thermal throttling, a power-saving governor, C1E after short idle periods | `MHz` lower than expected |
+| Remote NUMA memory | The thread runs on one node and its memory sits on another (multi-socket machines only) | Stalls up; check with `numastat -p` |
 
-中断按来源分类计数。EVL 带外 LAPIC 定时器（SIPIC）和 Linux 的 proxy tick（SIRQC）是实时核的正常流量：运行 1 ms 周期任务时每核约 2000 次/秒，不计入告警。温度事件中断（TRM）不可迁移，本机空闲时每核也有约 800 次/秒，只在明显异常时报告。
+A high miss rate is not by itself a sign of trouble. The reliable sign is a core's MPKI rising above its own normal level **while** IPC falls **and** the work takes longer. Only all three together show that the cache is slowing the task down.
 
-基线只用“忙碌”的采样（利用率 > 3%）建立，统计类检查也只对忙碌的采样进行。空闲的核在一个采样周期内只执行几百条指令，其 MPKI 和 IPC 没有意义。
+**Example: a low clock after short idle periods.** On the reference machine, an isolated core waking every 1 ms showed an average clock of about 1.6 GHz while it was awake, although its frequency was fixed at 2.9 GHz. There was no thermal throttling. The cause was C1E: entering C1 is promoted to C1E, which lowers the clock, and a thread running for only microseconds after each wake-up spends most of its time at that lower clock. Allowing only the POLL idle state restored 2.87 GHz. The `MHz` column shows this effect directly; `scaling_cur_freq` does not.
 
-### 5.2 实机测试结果
+## Requirements and limitations
 
-平台：ThinkBook 16 G7+ IAH（Core Ultra 9 285H），EVL 内核 6.18.29，实时核 CPU 4、5，以 root 运行，监测进程绑定 CPU 0。测试期间非实时核上一直运行着一个 llama-server 进程（负载约 12）。
+- **Linux** with `perf_event_open()`. CPU-wide counting needs root or `perf_event_paranoid` ≤ 0. As an unprivileged user with `perf_event_paranoid` = 2, only `-p` on your own threads works, counting user space only; pmutop falls back to that automatically.
+- **Virtual machines** (including WSL2) usually expose no hardware PMU. pmutop then shows only software events and `/proc` / sysfs data.
+- **x86 / Intel** is what pmutop has been tested on. Built-in raw codes exist for Core Ultra 200H only. Generic events work elsewhere, and raw codes can be given on the command line. ARM and AMD have not been tested.
+- **Counter budget.** Each core has a few general-purpose counters (on the reference P-cores, a group of 10 programmable events no longer fits; 7 do), plus fixed counters. Adding events means removing others, or splitting groups, which the kernel then rotates.
+- **`stall%`** uses the generic back-end-stall event, which most Intel cores do not provide.
+- **Baseline drift.** A slowdown that lasts longer than the 120-sample learning window becomes the new normal and stops warning. This is deliberate, so the tool adapts to real changes in workload. For real-time work, frame telemetry (FAIL) covers sustained degradation.
+- The warnings still use last-level-cache MPKI, while the charts show L2.
 
-| 测试 | 方法 | 结果 |
+## Validation
+
+All results are from the reference machine: Lenovo ThinkBook 16 G7+ IAH, Intel Core Ultra 9 285H (6 P-cores, 8 E-cores, 2 LP E-cores), Linux 6.18 with Xenomai 4, cores 4 and 5 isolated, pmutop run as root on CPU 0.
+
+| Check | Method | Result |
 |---|---|---|
-| 单元测试 `make check` | 用本机真实格式的 `/proc/interrupts` 构造两次快照 | 定时器、温度、IPI、设备四类计数全部正确；设备名解析正确 |
-| 无干扰时不误报 | evl-pingpong 60 s，同时在非实时核上运行 stress-ng（cache ×10 `--cache-no-affinity`，vm ×4 2 GiB） | 114 个采样全部 OK；pingpong 判定 PASS |
-| 计数器共享 | 两个 pmutop 实例与 perf 同时计数 CPU 2、4 | 两个实例均持续读数；L2/K 为 10.0、1.50，perf 单独测得 9.46、1.58 |
-| 设备中断检测 | 把 Wi-Fi 中断 IRQ 183 的亲和改到 CPU 4，并 ping 网关产生流量 | 改动后的第一个采样即 WARN：`device IRQ on an RT core: 91/s, busiest IRQ 183: iwlwifi:default_queue`；恢复后回到 OK |
-| 缓存劣化检测 | `tests/phases.c` 在 CPU 4 上先运行 50 s 缓存友好负载（64 KiB 顺序读），再运行 20 s 随机指针追逐（512 MiB），两阶段利用率相同（约 48%） | 平稳阶段 92 个采样全部 OK（IPC 4.84，LLC MPKI 0.003）；劣化阶段 36 个采样中 32 个 WARN（IPC 0.027，LLC MPKI 约 83，dTLB MPKI 约 79），其余 4 个位于阶段切换处 |
-| 帧遥测 | `scripts/mock_rt.c` 每 100 帧故意超时一次 | 每 500 ms 报告 5 次超周期，状态 FAIL，并给出最坏帧耗时 |
+| Event values | pmutop and `perf stat` on the same core at the same time, 512 MiB random pointer chase | L2/K: P-core 16.20 vs 16.57, E-core 16.67 vs 16.24, LP E-core 26.92 vs 26.96. L1D/K: P 71.7 vs 72.7, E 103.6 vs 106.2. iTLB/K: P 0.96 vs 0.92, E 0.66 vs 0.71. L1I/K (P-core, light load): 0.18–0.21 vs 0.17–0.20 |
+| Counter sharing | Two pmutop instances and perf counting the same cores at once | Both instances kept reading; L2/K 10.0 and 1.50 vs 9.46 and 1.58 with perf alone |
+| CPU usage | Known loads | Idle 0.6–0.7 %; 1 ms real-time loop 2.0–3.0 % (Linux: 0 %); 50 % Linux task 55.8 % (Linux: 50.5 %) |
+| No false alarms | Real-time loop on isolated cores for 60 s, memory and cache stress on the other cores | 114 of 114 samples OK |
+| Device-interrupt detection | Wi-Fi interrupt moved onto an isolated core, with traffic | Warned from the first sample, naming `IRQ 183: iwlwifi:default_queue`; OK again after restoring |
+| Cache-degradation detection | Same core, same CPU usage (about 48 %): 50 s of cache-friendly reads, then 20 s of random pointer chasing | Calm phase 92/92 OK (IPC 4.84); degraded phase 32/36 WARN (IPC 0.03); the other 4 at the switchover |
+| Frame telemetry | `scripts/mock_rt.c`, every 100th frame late | FAIL with the number of late frames and the worst frame time |
+| Interrupt parsing | `make check`, using `/proc/interrupts` snapshots in the reference machine's format | Timer, thermal, IPI and device counts and device names correct |
 
-注意：stress-ng 的 `--cache` 压力项默认会自行修改 CPU 亲和、轮流跑到所有核上（包括隔离核），`taskset` 对它无效，必须加 `--cache-no-affinity`。早期一次测试因此在 CPU 5 上误报了 IPC 下降——那次 CPU 5 上确实运行着 stress-ng。evl-pingpong 的压力测试只用了 `--cpu`、`--vm`、`--io`，不受影响。
+When stress-testing, note that `stress-ng --cache` moves its workers onto every CPU by itself, ignoring `taskset`. Add `--cache-no-affinity` to keep it off isolated cores.
 
-### 5.3 监测本身的开销
-
-evl-pingpong 在 CPU 4、5 上运行 60 s，分别在不运行监测、监测间隔 1000 ms、监测间隔 100 ms 三种条件下各测两轮（单位 µs）：
-
-| 条件 | 唤醒延迟 平均 | 唤醒延迟 P99.9 | 唤醒延迟 最大 | 往返 最大 | 判定 |
-|---|---:|---:|---:|---:|---|
-| 无监测（两轮） | 1.72 / 2.06 | 6.40 / 6.24 | 16.1 / 16.9 | 55.6 / 55.2 | PASS |
-| 1000 ms（两轮） | 1.71 / 2.31 | 6.04 / 4.51 | 18.4 / 11.6 | 44.4 / 54.3 | PASS |
-| 100 ms（两轮） | 2.04 / 2.00 | 8.65 / 5.64 | 17.9 / 14.2 | 55.7 / 54.9 | PASS |
-
-三种条件之间的差异与同一条件两轮之间的差异处于同一量级，在 60 s 测试的分辨率内未观察到监测带来的影响。更小的影响需要更长时间的测试才能分辨。
-
-### 5.4 尚未验证
-
-- 后端停顿（`stall%`）：本机 Intel PMU 不提供通用的 `stalled-cycles-backend` 事件，该列为空；需要改用 Intel 专用事件（如 `CYCLE_ACTIVITY.STALLS_MEM_ANY`）；
-- 远端 NUMA 内存：本机只有一个 NUMA 节点，无法测试；
-- 真实 EVL 任务接入帧遥测：目前只用模拟生产者验证，evl-pingpong 尚未调用 `rft_publish()`；
-- 长时间运行下基线的漂移：基线窗口为 120 个忙碌采样，持续的劣化会逐渐被吸收进基线，告警随之消失。这是有意的设计（适应负载的正常变化），但持续劣化应由帧遥测的 FAIL 兜底。
-
-## 6. 文件
+## Source layout
 
 ```
-src/main.c        主循环、参数、输出
-src/perf.c/.h     perf_event_open：计数组、软件事件回退、停止后读取
-src/sysfs.c       /proc/stat、/proc/interrupts、cpufreq、cpuidle、温度
-src/metrics.c/.h  MPKI、IPC 等比率，中位数/MAD 基线，告警规则
-src/telemetry.c/.h  帧遥测的只读映射
-telemetry/rt_frames.h  实时任务端的发布接口（头文件，无依赖）
-scripts/mock_rt.c 模拟实时任务
-scripts/selftest.sh  冒烟测试（无需 root、无需 PMU）
-scripts/ontarget/ 实机测试脚本：regress.sh（误报与中断注入）、cache-phases.sh（缓存劣化）、overhead.sh（监测开销）、graphic-demo.sh（图形界面演示）
-tests/test_irq.c  中断分类单元测试（make check）
-tests/phases.c    缓存行为分阶段变化的负载
-tests/ptyshot.py  在伪终端中运行 -graphic 并保存最后一屏（无人值守测试用）
-src/ui.c/.h       -graphic 全屏界面（ANSI 转义序列，不依赖 curses）
-tools/irqcheck.py 列出一段时间内落到指定核上的中断
+src/main.c            main loop, options, text and CSV output
+src/perf.c, perf.h    perf_event_open: counter groups, raw events per core type,
+                      group read with time scaling, software fallback
+src/sysfs.c           /proc/stat, /proc/interrupts (by source), cpufreq, cpuidle, temperature
+src/metrics.c, .h     ratios, median/MAD baselines, warning rules
+src/ui.c, ui.h        full-screen view: panel grid, pages, charts (ANSI escape sequences, no curses)
+src/telemetry.c, .h   read-only view of frame telemetry
+src/pmutop.h          shared sample structure
+telemetry/rt_frames.h publishing side for real-time tasks (header only)
+scripts/mock_rt.c     stand-in real-time producer
+scripts/selftest.sh   smoke test, no root or PMU needed
+scripts/ontarget/     tests for the reference machine (paths assume ~/pmutop)
+tests/test_irq.c      interrupt-classification unit test (make check)
+tests/phases.c        workload whose cache behaviour changes on cue
+tests/ptyshot.py      runs the full-screen view in a pseudo-terminal and saves the last screen
+tests/colors.py       checks chart colours in a ptyshot capture
+tools/irqcheck.py     lists the interrupts delivered to given cores over a time window
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
