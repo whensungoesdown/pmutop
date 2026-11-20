@@ -237,7 +237,7 @@ int main(int argc, char **argv)
 	struct telem tel;
 	FILE *csv = NULL;
 	char err[256];
-	const char *cpus_arg = NULL, *l2_spec = NULL, *l1d_spec = NULL;
+	const char *cpus_arg = NULL, *l2_spec = NULL, *l1d_spec = NULL, *l1i_spec = NULL;
 	const char *show = NULL;
 	char raw_msg[160] = "";
 	int i, c, iter, ret;
@@ -245,17 +245,19 @@ int main(int argc, char **argv)
 		{ "graphic", no_argument, NULL, 'g' },
 		{ "l2-event", required_argument, NULL, 'L' },
 		{ "l1d-event", required_argument, NULL, 'D' },
+		{ "l1i-event", required_argument, NULL, 'I' },
 		{ "show", required_argument, NULL, 's' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	/* _only: "-graphic" works as well as "--graphic" and "-g" */
-	while ((c = getopt_long_only(argc, argv, "c:D:gi:L:n:o:p:s:t:vh", lopts, NULL)) != -1) {
+	while ((c = getopt_long_only(argc, argv, "c:D:gI:i:L:n:o:p:s:t:vh", lopts, NULL)) != -1) {
 		switch (c) {
 		case 'g': o.graphic = true; break;
 		case 'L': l2_spec = optarg; break;
 		case 'D': l1d_spec = optarg; break;
+		case 'I': l1i_spec = optarg; break;
 		case 's': show = optarg; break;
 		case 'c': cpus_arg = optarg; break;
 		case 'i': o.interval_ms = atoi(optarg); break;
@@ -272,8 +274,8 @@ int main(int argc, char **argv)
 				"  -graphic  full-screen charts"
 				" (keys: q quit, p pause, c clear events)\n"
 				"  --show LIST  charts for -graphic, in order:"
-				" frame,cpu,pf,l1i,l1d,l2,itlb,dtlb (default all)\n"
-				"  --l2-event / --l1d-event PMU:CONFIG[,PMU:CONFIG]"
+				" frame,cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb (default all)\n"
+				"  --l2-event / --l1d-event / --l1i-event PMU:CONFIG[:CONFIG1][,...]"
 				"  raw event per core type (built in for Core Ultra 200H)\n"
 				"  Default CPU list: /sys/devices/system/cpu/isolated.\n"
 				"  CPU-wide counters need root and a working PMU;\n"
@@ -325,13 +327,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "no ref-cycles counter: busy%% unavailable\n");
 
 	/*
-	 * L2 and L1D misses are raw events, per core type; a core without a
+	 * L2, L1D and L1I misses are raw events, per core type; a core without a
 	 * code for its type just has no data for that chart.
 	 */
 	{
 		const struct { int ev; const char *what; const char *spec; } rawv[] = {
 			{ EV_L2_MISSES, "L2", l2_spec },
 			{ EV_L1D_MISSES, "L1D", l1d_spec },
+			{ EV_L1I_MISSES, "L1I", l1i_spec },
 		};
 
 		for (unsigned k = 0; k < sizeof(rawv) / sizeof(rawv[0]); k++) {

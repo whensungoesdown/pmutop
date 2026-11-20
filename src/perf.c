@@ -55,21 +55,17 @@ static struct ev_desc ev_tab[] = {
 			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
 			     "dTLB/read/miss" },
 	/*
-	 * Generic events, mapped per core type by the kernel
-	 * (arch/x86/events/intel/core.c): on Core Ultra 200H P-cores
-	 * (glc table) L1I miss = L2_RQSTS.ALL_CODE_RD 0xe424, iTLB miss =
-	 * ITLB_MISSES.WALK_COMPLETED 0xe11; on E-cores (glp table)
-	 * ICACHE.MISSES 0x0280 and ITLB.MISS 0x0481.  The generic L1D miss
-	 * is not mapped on E-cores, hence the raw EV_L1D_MISSES below.
+	 * Generic iTLB miss, mapped per core type by the kernel
+	 * (arch/x86/events/intel/core.c): ITLB_MISSES.WALK_COMPLETED 0xe11
+	 * on Core Ultra 200H P-cores, ITLB.MISS 0x0481 on E-cores.  L1I and
+	 * L1D are raw events (see raw_evs): the generic L1I miss on P-cores
+	 * is L2_RQSTS.ALL_CODE_RD, which counts code requests including
+	 * prefetches, and the generic L1D miss is not mapped on E-cores.
 	 */
 	[EV_ITLB_MISSES] = { PERF_TYPE_HW_CACHE,
 			     PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8)
 			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
 			     "iTLB/read/miss" },
-	[EV_L1I_MISSES]	 = { PERF_TYPE_HW_CACHE,
-			     PERF_COUNT_HW_CACHE_L1I | (PERF_COUNT_HW_CACHE_OP_READ << 8)
-			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
-			     "L1-icache/read/miss" },
 	[EV_STALL_MEM]	 = { PERF_TYPE_HARDWARE,
 			     PERF_COUNT_HW_STALLED_CYCLES_BACKEND,
 			     "stalled-cycles-backend" },
@@ -78,6 +74,7 @@ static struct ev_desc ev_tab[] = {
 	/* per core type, filled in by perf_setup_raw() */
 	[EV_L2_MISSES]	 = { 0, 0, "L2 miss (per-PMU raw event)" },
 	[EV_L1D_MISSES]	 = { 0, 0, "L1D miss (per-PMU raw event)" },
+	[EV_L1I_MISSES]	 = { 0, 0, "L1I miss (per-PMU raw event)" },
 	[EV_TASK_CLOCK]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK,
 			     "task-clock" },
 	[EV_CTX_SWITCH]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES,
@@ -192,11 +189,17 @@ static int cpu_model(void)
  *             E  cpu_atom      MEM_LOAD_UOPS_RETIRED.L2_MISS   0x80d1
  *   L1D miss  P  cpu_core      MEM_LOAD_RETIRED.L1_MISS        0x08d1
  *             E  cpu_atom      MEM_LOAD_UOPS_RETIRED.L1_MISS   0x40d1
+ *   L1I miss  P  cpu_core      FRONTEND_RETIRED.L1I_MISS       0x03c6, frontend 0x12
+ *             E  cpu_atom      FRONTEND_RETIRED.ICACHE         0x20c6
  *   LP E-cores (cpu_lowpower) share the E-core design; perf has no table
  *   for them and the E-core codes are used.
  *
- * Both L1D events count retired loads that missed L1D, so P- and E-cores
- * measure the same thing.  For L2 the P-core event counts demand data
+ * Both L1D events count retired loads that missed L1D, and both L1I
+ * events retired instructions fetched after an L1I miss (prefetches and
+ * wrong-path fetches excluded), so P- and E-cores measure the same thing.
+ * The P-core L1I event needs an extra "frontend" selector, which the
+ * cpu_core PMU takes in config1 (format/frontend: config1:0-23); a code
+ * is written pmu:config[:config1].  For L2 the P-core event counts demand data
  * read requests instead: close, not identical.
  */
 #define MAX_RAW_PMUS	4
@@ -205,6 +208,7 @@ struct raw_pmu {
 	char		name[32];
 	uint32_t	type;
 	uint64_t	config;
+	uint64_t	config1;	/* e.g. the "frontend" field of cpu_core */
 	char		cpus[128];	/* CPUs this PMU covers */
 };
 
@@ -215,6 +219,7 @@ static struct raw_ev {
 } raw_evs[EV_NR] = {
 	[EV_L2_MISSES]	= { "cpu_core:0x2124,cpu_atom:0x80d1,cpu_lowpower:0x80d1" },
 	[EV_L1D_MISSES]	= { "cpu_core:0x08d1,cpu_atom:0x40d1,cpu_lowpower:0x40d1" },
+	[EV_L1I_MISSES]	= { "cpu_core:0x03c6:0x12,cpu_atom:0x20c6,cpu_lowpower:0x20c6" },
 };
 
 /*
@@ -241,12 +246,13 @@ int perf_setup_raw(int ev, const char *spec, char *msg, size_t msglen)
 	for (tok = strtok_r(copy, ",", &save); tok && r->n < MAX_RAW_PMUS;
 	     tok = strtok_r(NULL, ",", &save)) {
 		struct raw_pmu *p = &r->pmu[r->n];
-		unsigned long long config;
+		unsigned long long config, config1 = 0;
 
-		if (sscanf(tok, "%31[^:]:%llx", p->name, &config) != 2) {
-			snprintf(msg, msglen, "bad event '%s' (want pmu:0xconfig)", tok);
+		if (sscanf(tok, "%31[^:]:%llx:%llx", p->name, &config, &config1) < 2) {
+			snprintf(msg, msglen, "bad event '%s' (want pmu:0xconfig[:0xconfig1])", tok);
 			continue;
 		}
+		p->config1 = config1;
 		snprintf(path, sizeof(path), "/sys/bus/event_source/devices/%s/type", p->name);
 		if (read_line(path, buf, sizeof(buf)) < 0)
 			continue;	/* e.g. no cpu_lowpower on this chip */
@@ -302,6 +308,7 @@ static int open_one(struct perf_group *g, int e, int group_fd)
 			return -ENOENT;
 		attr.type = p->type;
 		attr.config = p->config;
+		attr.config1 = p->config1;
 	}
 	attr.disabled = group_fd < 0;	/* the leader starts the group */
 	attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID |

@@ -18,11 +18,11 @@ enum {
 	EV_LLC_MISSES,
 	EV_DTLB_MISSES,
 	EV_ITLB_MISSES,
-	EV_L1I_MISSES,
 	EV_STALL_MEM,
 	EV_REF_CYCLES,		/* unhalted cycles at the fixed reference rate */
 	EV_L2_MISSES,		/* model-specific raw event, see perf_setup_raw() */
 	EV_L1D_MISSES,		/* model-specific raw event, see perf_setup_raw() */
+	EV_L1I_MISSES,		/* model-specific raw event, see perf_setup_raw() */
 	EV_TASK_CLOCK,		/* software: only meaningful for a thread */
 	EV_CTX_SWITCH,		/* software: a thread leaving the OOB stage */
 	EV_PAGE_FAULT,		/* software: a thread faulting and demoting */

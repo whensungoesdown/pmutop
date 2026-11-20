@@ -43,6 +43,7 @@
 
 enum {
 	G_BUSY = 0,
+	G_IPC,
 	G_PF,
 	G_L1I,
 	G_L1D,
@@ -87,6 +88,13 @@ static const struct graph_desc gd[G_NR] = {
 	/*                  name               down   neutr  log    lo  hi       fmt     warn   bad */
 	[G_BUSY]  = { "CPU usage %",      false, true,  false, 0,  100,     "%.1f", 70,    90 },
 	/*
+	 * Instructions per cycle, higher is better: grows up, fixed range
+	 * 0-5.  On every core green, yellow below 0.5, red below 0.2;
+	 * pingpong cores run at 0.7-0.9, the 512 MiB random chase drops to
+	 * 0.03.  Meaningless on an idle core (a few hundred instructions).
+	 */
+	[G_IPC]   = { "IPC",             false, false, false, 0,  5,       "%.2f", 0.5,   0.2 },
+	/*
 	 * A page fault in an EVL thread demotes it to Linux, so on an RT
 	 * core any fault is suspect; a running pingpong core takes none.
 	 */
@@ -100,12 +108,13 @@ static const struct graph_desc gd[G_NR] = {
 	/* evl-pingpong: tens per second; a TLB-hostile task: millions */
 	/*
 	 * L1 and iTLB, measured on the ThinkBook (per second):
-	 *                 idle core  pingpong core  512 MiB random chase
-	 *   L1I miss         6k          33k         5-8M
-	 *   iTLB miss         8          2.6k        21-28k
-	 * L1D (retired loads missing L1D): see README.
+	 *                 idle core  pingpong core  + memory-heavy neighbours
+	 *   L1I miss        200      3.6-5.5k        45k
+	 *   iTLB miss         8          2.6k
+	 * L1I counts retired instructions fetched after an L1I miss
+	 * (FRONTEND_RETIRED.*); L1D retired loads missing L1D: see README.
 	 */
-	[G_L1I]   = { "L1I miss/s",      true,  false, false, 0,  50000,   NULL,   200000, 1000000, { 50000, 500000, 5000000, 50000000 } },
+	[G_L1I]   = { "L1I miss/s",      true,  false, false, 0,  10000,   NULL,   20000, 100000, { 10000, 100000, 1000000, 10000000 } },
 	[G_L1D]   = { "L1D miss/s",      true,  false, false, 0,  50000,   NULL,   200000, 1000000, { 50000, 500000, 5000000, 50000000 } },
 	[G_ITLB]  = { "iTLB miss/s",     true,  false, false, 0,  5000,    NULL,   10000, 50000,  { 5000, 50000, 500000, 5000000 } },
 	[G_TLB]   = { "dTLB miss/s",     true,  false, false, 0,  10000,   NULL,   1000,  5000, { 1000, 10000, 1000000, 20000000 } },
@@ -460,6 +469,7 @@ void ui_push(int slot, const struct cpu_sample *s, const struct metrics *m,
 		h->last_state = CPU_OK;
 	h->cpu = s->cpu;
 	h->v[G_BUSY][i] = (isfinite(m->busy) ? m->busy : m->util) * 100.0;
+	h->v[G_IPC][i] = m->ipc;
 	h->v[G_PF][i] = s->ev_ok[EV_PAGE_FAULT] && dt > 0 ?
 			s->ev[EV_PAGE_FAULT] / dt : NAN;
 	h->v[G_L2][i] = s->ev_ok[EV_L2_MISSES] && dt > 0 ?
@@ -549,7 +559,8 @@ static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, in
 	const struct graph_desc *d = &gd[g];
 	bool laddered = d->rung[0] > 0;
 	/* red alarm only where a high value is a fault: isolated cores */
-	bool alarm = h->m.rt_core || g == G_BUSY;
+	/* IPC and CPU usage use their bands on every core */
+	bool alarm = h->m.rt_core || g == G_BUSY || g == G_IPC;
 	unsigned n = h->n < HIST ? h->n : HIST;
 	int pw = w - AXIS_W;			/* plot width */
 	unsigned shown = n < (unsigned)pw ? n : (unsigned)pw;
@@ -614,7 +625,7 @@ static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, in
 			dd.hi = d->rung[h->rung[g][i]];
 			col = rung_col[h->rung[g][i]];
 		} else {
-			col = level_col(d, v);
+			col = alarm ? level_col(d, v) : C_CYAN;
 		}
 		if (alarm && isfinite(v) && level_col(d, v) == C_RED)
 			col = C_RED;
@@ -662,7 +673,7 @@ static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, in
 
 /* Charts to show, in order; set by ui_select() (--show). */
 static const struct { const char *key; int g; } chart_keys[] = {
-	{ "frame", G_FRAME }, { "cpu", G_BUSY }, { "pf", G_PF },
+	{ "frame", G_FRAME }, { "cpu", G_BUSY }, { "ipc", G_IPC }, { "pf", G_PF },
 	{ "l1i", G_L1I }, { "l1d", G_L1D }, { "l2", G_L2 },
 	{ "itlb", G_ITLB }, { "dtlb", G_TLB },
 };
@@ -720,10 +731,23 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 		if (sel[i] != G_FRAME || info.telemetry)
 			order[norder++] = sel[i];
 
-	/* header: 3 rows */
-	put_textf(r0, c0, 8, A_BOLD, "CPU %d", h->cpu);
+	/*
+	 * header: 3 rows.  A core isolated from Linux (isolcpus) gets an
+	 * "ISOLATED" tag in reverse magenta and heavy magenta dividers, so it
+	 * stands out from the ordinary cores.
+	 */
+	put_textf(r0, c0, 8, A_BOLD | (h->m.rt_core ? C_MAGENTA : 0), "CPU %d", h->cpu);
 	put_textf(r0, c0 + 8, 6, state_col(m->health) | A_REV | A_BOLD, " %-4s ",
 		  state_name(m->health));
+	int tagw = 0;
+
+	if (h->m.rt_core) {
+		const char *tag = " ISOLATED ";
+
+		tagw = (int)strlen(tag) + 1;
+		put_text(r0, c0 + w - tagw + 1, tagw - 1, tag, C_MAGENTA | A_REV | A_BOLD);
+		w -= tagw;		/* keep the status line clear of it */
+	}
 	if (isfinite(m->temp_c))
 		snprintf(t, sizeof(t), "%.0fC", m->temp_c);
 	else
@@ -732,6 +756,7 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 	snprintf(b, sizeof(b), "%.1f%%", (isfinite(m->busy) ? m->busy : m->util) * 100);
 	put_textf(r0, c0 + 15, w - 15, C_DEF, "CPU %s  %.0f MHz  %s",
 		  b, m->freq_mhz, t);
+	w += tagw;		/* full width again below the tag */
 	put_textf(r0 + 1, c0, w, C_DIM,
 		  "IRQ/s: timer %.0f  thermal %.0f  IPI %.0f  device %.0f",
 		  s->irq_timer * rate, s->irq_thermal * rate,
@@ -797,9 +822,17 @@ void ui_draw(int nslots)
 	pw = nslots ? (cols - gap * (nslots - 1)) / nslots : cols;
 	for (i = 0; i < nslots; i++)
 		draw_panel(&hist[i], 2, i * (pw + gap), pw, ph);
-	for (i = 1; i < nslots; i++)
+	/*
+	 * Dividers between panels; the edges of an isolated core's panel are
+	 * drawn heavy and magenta, so the real-time cores read as one block.
+	 */
+	for (i = 1; i < nslots; i++) {
+		bool hot = hist[i - 1].m.rt_core || hist[i].m.rt_core;
+
 		for (int r = 2; r < 2 + ph; r++)
-			put_cell(r, i * (pw + gap) - 2, "│", C_DIM);
+			put_cell(r, i * (pw + gap) - 2, hot ? "┃" : "│",
+				 hot ? C_MAGENTA : C_DIM);
+	}
 
 	/* event log, newest first */
 	int r = rows - ev_rows;
