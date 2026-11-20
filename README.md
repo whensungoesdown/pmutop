@@ -14,19 +14,9 @@ From these you can usually tell whether a core is limited by memory, by instruct
 
 Cores isolated from the Linux scheduler (`isolcpus`), as used for real-time work such as **Xenomai 4 / EVL**, get extra support. Their usage figure includes out-of-band threads that Linux cannot see, they get stricter alarm rules, and a real-time task can report its own frame timing to pmutop.
 
-A capture from the reference machine, `--show ipc,cpu`, with an ordinary core (CPU 3) next to two isolated cores running a 1 ms real-time loop (CPU 4 and 5):
+![pmutop on a 16-core Intel Core Ultra 9 285H](docs/pmutop-screenshot.png)
 
-```
-CPU 3    OK    CPU 0.0%  1784 MHz  48C            ┃ CPU 4    OK    CPU 2.4%  1574 MHz  48C    ISOLATED  ┃ CPU 5 ...  ISOLATED
-IRQ/s: timer 0  thermal 0  IPI 0  device 0        ┃ IRQ/s: timer 1011  thermal 0  IPI 0  device 0     ┃ ...
-▲ IPC 0.25                        higher = better ┃ ▲ IPC 0.75                       higher = better   ┃ ▲ IPC 0.84 ...
-     5│                                           ┃      5│                                            ┃      5│
-      │▅ ▄  ▆  ▅ ▆  ▆  ▆ ▆  ▆  ▆  ▆  ▆  ▆  ▇ ▄    ┃       │                                            ┃       │
-      │█ █  █  █ █  █  █ █  █  █  █  █  █  █ █    ┃       │▂▂▁▂▁▂▂▂▂▂▄▄▄▄▃          ▂▂▂▂▂▂▂▂▂▁▂▂▂       ┃       │▃▃▃▃▃▃▃▃▃▂▄▅▄▅▆
-     0│█▃█▄▂█▃▂█▃█▃▄█▃▃█▃█▃▃█▃▃█▂▂█▃▃█▃▃█▃▃█▂█    ┃      0│███████████████████████████████████████    ┃      0│███████████████▇▁▁▁▁▁▁▁▁▁▁▁▁▆█████
-```
-
-CPU 5's IPC collapses in the middle, while a cache-thrashing task runs there; on screen those bars turn yellow, then red.
+*`pmutop` with no options on a 16-core Intel Core Ultra 9 285H: every core, every chart. CPU 4 and 5 are isolated real-time cores (magenta `ISOLATED` tag and dividers). The event log at the bottom shows warnings raised on CPU 2 and CPU 14.*
 
 ## Contents
 
