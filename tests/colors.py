@@ -8,7 +8,7 @@ names = {"32": "green", "33": "yellow", "31": "red"}
 chart = None
 for line in frame.split("\r\n"):
     plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
-    for title in ("CPU usage", "page fault", "LLC miss", "dTLB miss", "device IRQ", "non-timer"):
+    for title in ("CPU usage", "page fault", "L1I miss", "L1D miss", "L2 miss", "iTLB miss", "dTLB miss"):
         if title in plain[:30]:
             chart = title
     if chart and "│" in plain[:9]:

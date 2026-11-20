@@ -44,10 +44,11 @@
 enum {
 	G_BUSY = 0,
 	G_PF,
+	G_L1I,
+	G_L1D,
 	G_L2,
+	G_ITLB,
 	G_TLB,
-	G_DEV,
-	G_IRQ,
 	G_FRAME,
 	G_NR,
 };
@@ -97,11 +98,17 @@ static const struct graph_desc gd[G_NR] = {
 	 */
 	[G_L2]    = { "L2 miss/s",       true,  false, false, 0,  100000,  NULL,   50000, 100000, { 10000, 100000, 1000000, 20000000 } },
 	/* evl-pingpong: tens per second; a TLB-hostile task: millions */
+	/*
+	 * L1 and iTLB, measured on the ThinkBook (per second):
+	 *                 idle core  pingpong core  512 MiB random chase
+	 *   L1I miss         6k          33k         5-8M
+	 *   iTLB miss         8          2.6k        21-28k
+	 * L1D (retired loads missing L1D): see README.
+	 */
+	[G_L1I]   = { "L1I miss/s",      true,  false, false, 0,  50000,   NULL,   200000, 1000000, { 50000, 500000, 5000000, 50000000 } },
+	[G_L1D]   = { "L1D miss/s",      true,  false, false, 0,  50000,   NULL,   200000, 1000000, { 50000, 500000, 5000000, 50000000 } },
+	[G_ITLB]  = { "iTLB miss/s",     true,  false, false, 0,  5000,    NULL,   10000, 50000,  { 5000, 50000, 500000, 5000000 } },
 	[G_TLB]   = { "dTLB miss/s",     true,  false, false, 0,  10000,   NULL,   1000,  5000, { 1000, 10000, 1000000, 20000000 } },
-	/* any device interrupt on an RT core is a placement error */
-	[G_DEV]   = { "device IRQ/s",    true,  false, false, 0,  200,     NULL,   0.5,   100, { 200, 2000, 20000, 200000 } },
-	/* thermal + IPI + device: everything except EVL's own timer */
-	[G_IRQ]   = { "non-timer IRQ/s", true,  false, false, 0,  5000,    NULL,   1000,  4000, { 5000, 20000, 100000, 1000000 } },
 	/* against a 1 ms period */
 	[G_FRAME] = { "worst frame us",  true,  false, false, 0,  1000,    "%.1f", 500,   900 },
 };
@@ -459,9 +466,12 @@ void ui_push(int slot, const struct cpu_sample *s, const struct metrics *m,
 			s->ev[EV_L2_MISSES] / dt : NAN;
 	h->v[G_TLB][i] = s->ev_ok[EV_DTLB_MISSES] && dt > 0 ?
 			 s->ev[EV_DTLB_MISSES] / dt : NAN;
-	h->v[G_DEV][i] = dt > 0 ? s->irq_device / dt : NAN;
-	h->v[G_IRQ][i] = dt > 0 ? (s->irq_thermal + s->irq_ipi + s->irq_device) / dt
-				: NAN;
+	h->v[G_L1I][i] = s->ev_ok[EV_L1I_MISSES] && dt > 0 ?
+			 s->ev[EV_L1I_MISSES] / dt : NAN;
+	h->v[G_L1D][i] = s->ev_ok[EV_L1D_MISSES] && dt > 0 ?
+			 s->ev[EV_L1D_MISSES] / dt : NAN;
+	h->v[G_ITLB][i] = s->ev_ok[EV_ITLB_MISSES] && dt > 0 ?
+			  s->ev[EV_ITLB_MISSES] / dt : NAN;
 	h->v[G_FRAME][i] = worst_frame_us > 0 ? worst_frame_us : NAN;
 	h->st[i] = (unsigned char)m->health;
 	for (int g = 0; g < G_NR; g++)
@@ -650,6 +660,54 @@ static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, in
 	}
 }
 
+/* Charts to show, in order; set by ui_select() (--show). */
+static const struct { const char *key; int g; } chart_keys[] = {
+	{ "frame", G_FRAME }, { "cpu", G_BUSY }, { "pf", G_PF },
+	{ "l1i", G_L1I }, { "l1d", G_L1D }, { "l2", G_L2 },
+	{ "itlb", G_ITLB }, { "dtlb", G_TLB },
+};
+#define NKEYS	((int)(sizeof(chart_keys) / sizeof(chart_keys[0])))
+static int sel[G_NR], nsel;
+
+/*
+ * @spec: comma-separated chart keys in display order, "all", or NULL for
+ * all of them.  Returns -1 with a message on an unknown key.
+ */
+int ui_select(const char *spec, char *err, size_t errlen)
+{
+	char copy[256], *tok, *save = NULL;
+
+	nsel = 0;
+	if (!spec || strcmp(spec, "all") == 0) {
+		for (int k = 0; k < NKEYS; k++)
+			sel[nsel++] = chart_keys[k].g;
+		return 0;
+	}
+	snprintf(copy, sizeof(copy), "%s", spec);
+	for (tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+		int k, dup = 0;
+
+		for (k = 0; k < NKEYS && strcmp(tok, chart_keys[k].key); k++)
+			;
+		if (k == NKEYS) {
+			int n = snprintf(err, errlen, "unknown chart '%s'; choose from all", tok);
+
+			for (k = 0; k < NKEYS && n > 0 && (size_t)n < errlen; k++)
+				n += snprintf(err + n, errlen - n, ",%s", chart_keys[k].key);
+			return -1;
+		}
+		for (int j = 0; j < nsel; j++)
+			dup |= sel[j] == chart_keys[k].g;
+		if (!dup && nsel < G_NR)
+			sel[nsel++] = chart_keys[k].g;
+	}
+	if (!nsel) {
+		snprintf(err, errlen, "no chart selected");
+		return -1;
+	}
+	return 0;
+}
+
 static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 {
 	const struct cpu_sample *s = &h->s;
@@ -658,14 +716,9 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 	int order[G_NR], norder = 0, ncharts, ht, r, i;
 	char t[16], b[16];
 
-	if (info.telemetry)
-		order[norder++] = G_FRAME;
-	order[norder++] = G_BUSY;
-	order[norder++] = G_PF;
-	order[norder++] = G_L2;
-	order[norder++] = G_TLB;
-	order[norder++] = G_DEV;
-	order[norder++] = G_IRQ;
+	for (i = 0; i < nsel; i++)
+		if (sel[i] != G_FRAME || info.telemetry)
+			order[norder++] = sel[i];
 
 	/* header: 3 rows */
 	put_textf(r0, c0, 8, A_BOLD, "CPU %d", h->cpu);

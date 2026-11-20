@@ -22,5 +22,7 @@ void ui_draw(int nslots);
 /* Sleep up to @ms, serving the keyboard; returns 1 when the user quits. */
 int  ui_wait(int ms, int nslots);
 bool ui_paused(void);
+/* --show: chart keys (frame,cpu,pf,l1i,l1d,l2,itlb,dtlb) or "all" */
+int  ui_select(const char *spec, char *err, size_t errlen);
 
 #endif

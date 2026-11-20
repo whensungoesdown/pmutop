@@ -44,33 +44,40 @@ static struct ev_desc ev_tab[] = {
 			     "cycles" },
 	[EV_INSTRUCTIONS] = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS,
 			      "instructions" },
-	[EV_CACHE_REFS]	 = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES,
-			     "cache/read/access" },
 	[EV_CACHE_MISSES] = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES,
 			      "cache/read/miss" },
-	[EV_LLC_REFS]	 = { PERF_TYPE_HW_CACHE,
-			     PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8)
-			     | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16),
-			     "LLC/read/access" },
 	[EV_LLC_MISSES]	 = { PERF_TYPE_HW_CACHE,
 			     PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8)
 			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
 			     "LLC/read/miss" },
-	[EV_DTLB_REFS]	 = { PERF_TYPE_HW_CACHE,
-			     PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8)
-			     | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16),
-			     "dTLB/read/access" },
 	[EV_DTLB_MISSES] = { PERF_TYPE_HW_CACHE,
 			     PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8)
 			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
 			     "dTLB/read/miss" },
+	/*
+	 * Generic events, mapped per core type by the kernel
+	 * (arch/x86/events/intel/core.c): on Core Ultra 200H P-cores
+	 * (glc table) L1I miss = L2_RQSTS.ALL_CODE_RD 0xe424, iTLB miss =
+	 * ITLB_MISSES.WALK_COMPLETED 0xe11; on E-cores (glp table)
+	 * ICACHE.MISSES 0x0280 and ITLB.MISS 0x0481.  The generic L1D miss
+	 * is not mapped on E-cores, hence the raw EV_L1D_MISSES below.
+	 */
+	[EV_ITLB_MISSES] = { PERF_TYPE_HW_CACHE,
+			     PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8)
+			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
+			     "iTLB/read/miss" },
+	[EV_L1I_MISSES]	 = { PERF_TYPE_HW_CACHE,
+			     PERF_COUNT_HW_CACHE_L1I | (PERF_COUNT_HW_CACHE_OP_READ << 8)
+			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
+			     "L1-icache/read/miss" },
 	[EV_STALL_MEM]	 = { PERF_TYPE_HARDWARE,
 			     PERF_COUNT_HW_STALLED_CYCLES_BACKEND,
 			     "stalled-cycles-backend" },
 	[EV_REF_CYCLES]	 = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES,
 			     "ref-cycles" },
-	/* filled in by perf_setup_l2(); type 0 config 0 = not available */
+	/* per core type, filled in by perf_setup_raw() */
 	[EV_L2_MISSES]	 = { 0, 0, "L2 miss (per-PMU raw event)" },
+	[EV_L1D_MISSES]	 = { 0, 0, "L1D miss (per-PMU raw event)" },
 	[EV_TASK_CLOCK]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK,
 			     "task-clock" },
 	[EV_CTX_SWITCH]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES,
@@ -120,20 +127,7 @@ double perf_ref_hz(void)
 	return count ? (double)count / dt : 0;
 }
 
-/*
- * L2 misses have no generic perf event: the counter is model specific and
- * lives in a named PMU ("cpu" on most machines, "cpu_core"/"cpu_atom" on
- * Intel hybrids).  The kernel does not publish these encodings in sysfs
- * (perf carries them in its own JSON tables), so the default is the one
- * for this research platform and anything else is given with --l2-event:
- *
- *   --l2-event cpu_core:0x2124    PMU name : raw config
- *
- * Intel family 6 model 197 (Arrow Lake H, Core Ultra 200H) P-cores:
- * L2_RQSTS.DEMAND_DATA_RD_MISS = event 0x24, umask 0x21, i.e. config
- * 0x2124, as reported by "perf stat -vv -e cpu_core/l2_rqsts.demand_data_rd_miss/".
- * Returns 0 when the event will be counted on @cpu, -1 otherwise.
- */
+/* Is @cpu in a sysfs CPU list such as "0-5" or "6-13,16"? */
 static int cpu_in_list(const char *list, int cpu)
 {
 	const char *p = list;
@@ -188,53 +182,69 @@ static int cpu_model(void)
 	return fam == 6 ? model : -1;
 }
 
-/* One L2-miss event per PMU: hybrid CPUs need a different code per core type. */
-#define MAX_L2_PMUS	4
+/*
+ * Raw events chosen per PMU: hybrid CPUs need a different code per core
+ * type, and the kernel publishes none of these encodings in sysfs.
+ * Built-in codes are for Core Ultra 200H (family 6 model 197), taken from
+ * "perf list --details":
+ *
+ *   L2 miss   P  cpu_core      L2_RQSTS.DEMAND_DATA_RD_MISS    0x2124
+ *             E  cpu_atom      MEM_LOAD_UOPS_RETIRED.L2_MISS   0x80d1
+ *   L1D miss  P  cpu_core      MEM_LOAD_RETIRED.L1_MISS        0x08d1
+ *             E  cpu_atom      MEM_LOAD_UOPS_RETIRED.L1_MISS   0x40d1
+ *   LP E-cores (cpu_lowpower) share the E-core design; perf has no table
+ *   for them and the E-core codes are used.
+ *
+ * Both L1D events count retired loads that missed L1D, so P- and E-cores
+ * measure the same thing.  For L2 the P-core event counts demand data
+ * read requests instead: close, not identical.
+ */
+#define MAX_RAW_PMUS	4
 
-static struct l2_pmu {
+struct raw_pmu {
 	char		name[32];
 	uint32_t	type;
 	uint64_t	config;
 	char		cpus[128];	/* CPUs this PMU covers */
-} l2_pmus[MAX_L2_PMUS];
-static int nr_l2_pmus;
+};
+
+static struct raw_ev {
+	const char	*builtin;
+	struct raw_pmu	pmu[MAX_RAW_PMUS];
+	int		n;
+} raw_evs[EV_NR] = {
+	[EV_L2_MISSES]	= { "cpu_core:0x2124,cpu_atom:0x80d1,cpu_lowpower:0x80d1" },
+	[EV_L1D_MISSES]	= { "cpu_core:0x08d1,cpu_atom:0x40d1,cpu_lowpower:0x40d1" },
+};
 
 /*
- * @spec: "pmu:config[,pmu:config...]", or NULL for the built-in table.
- * Returns the number of PMUs configured; a PMU missing on this machine is
- * reported in @msg and skipped.
+ * @spec: "pmu:config[,pmu:config...]", or NULL for the built-in codes.
+ * Returns the number of PMUs configured for @ev; a PMU this machine does
+ * not have is skipped.
  */
-int perf_setup_l2(const char *spec, char *msg, size_t msglen)
+int perf_setup_raw(int ev, const char *spec, char *msg, size_t msglen)
 {
+	struct raw_ev *r = &raw_evs[ev];
 	char copy[256], *tok, *save = NULL, path[160], buf[256];
 
-	nr_l2_pmus = 0;
+	r->n = 0;
 	msg[0] = 0;
 	if (!spec) {
 		if (cpu_model() != 197) {
-			snprintf(msg, msglen, "no L2 event known for this CPU model;"
-				 " give one with --l2-event pmu:config");
+			snprintf(msg, msglen, "no %s code known for this CPU model",
+				 ev_tab[ev].name);
 			return 0;
 		}
-		/*
-		 * Core Ultra 200H, from "perf list --details":
-		 *   P-cores  cpu_core  L2_RQSTS.DEMAND_DATA_RD_MISS    0x2124
-		 *   E-cores  cpu_atom  MEM_LOAD_UOPS_RETIRED.L2_MISS   0x80d1
-		 *   LP E     cpu_lowpower: same core type as the E-cores;
-		 *            perf lists no table for it, 0x80d1 counts plausibly.
-		 * The E-core event counts retired loads that missed L2, the
-		 * P-core one demand data reads: close, not identical.
-		 */
-		spec = "cpu_core:0x2124,cpu_atom:0x80d1,cpu_lowpower:0x80d1";
+		spec = r->builtin;
 	}
 	snprintf(copy, sizeof(copy), "%s", spec);
-	for (tok = strtok_r(copy, ",", &save); tok && nr_l2_pmus < MAX_L2_PMUS;
+	for (tok = strtok_r(copy, ",", &save); tok && r->n < MAX_RAW_PMUS;
 	     tok = strtok_r(NULL, ",", &save)) {
-		struct l2_pmu *p = &l2_pmus[nr_l2_pmus];
+		struct raw_pmu *p = &r->pmu[r->n];
 		unsigned long long config;
 
 		if (sscanf(tok, "%31[^:]:%llx", p->name, &config) != 2) {
-			snprintf(msg, msglen, "bad --l2-event '%s' (want pmu:0xconfig)", tok);
+			snprintf(msg, msglen, "bad event '%s' (want pmu:0xconfig)", tok);
 			continue;
 		}
 		snprintf(path, sizeof(path), "/sys/bus/event_source/devices/%s/type", p->name);
@@ -245,23 +255,30 @@ int perf_setup_l2(const char *spec, char *msg, size_t msglen)
 		snprintf(path, sizeof(path), "/sys/bus/event_source/devices/%s/cpus", p->name);
 		if (read_line(path, p->cpus, sizeof(p->cpus)) < 0)
 			snprintf(p->cpus, sizeof(p->cpus), "0-%d", 4095);	/* non-hybrid */
-		nr_l2_pmus++;
+		r->n++;
 	}
-	return nr_l2_pmus;
+	return r->n;
 }
 
-/* The L2 PMU covering @cpu, or NULL (thread mode: none, cores differ). */
-static const struct l2_pmu *l2_for_cpu(int cpu)
+/* The PMU entry of @ev covering @cpu, or NULL (thread mode: cores differ). */
+static const struct raw_pmu *raw_for_cpu(int ev, int cpu)
 {
-	for (int i = 0; cpu >= 0 && i < nr_l2_pmus; i++)
-		if (cpu_in_list(l2_pmus[i].cpus, cpu))
-			return &l2_pmus[i];
+	const struct raw_ev *r = &raw_evs[ev];
+
+	for (int i = 0; cpu >= 0 && i < r->n; i++)
+		if (cpu_in_list(r->pmu[i].cpus, cpu))
+			return &r->pmu[i];
 	return NULL;
 }
 
-bool perf_l2_covers(int cpu)
+bool perf_raw_covers(int ev, int cpu)
 {
-	return l2_for_cpu(cpu) != NULL;
+	return raw_for_cpu(ev, cpu) != NULL;
+}
+
+static bool is_raw(int ev)
+{
+	return raw_evs[ev].builtin != NULL;
 }
 
 const char *perf_event_name(int ev)
@@ -278,8 +295,8 @@ static int open_one(struct perf_group *g, int e, int group_fd)
 	attr.type = ev_tab[e].type;
 	attr.size = sizeof(attr);
 	attr.config = ev_tab[e].config;
-	if (e == EV_L2_MISSES) {
-		const struct l2_pmu *p = l2_for_cpu(g->cpu);
+	if (is_raw(e)) {
+		const struct raw_pmu *p = raw_for_cpu(e, g->cpu);
 
 		if (!p)
 			return -ENOENT;
@@ -359,8 +376,8 @@ int perf_open(struct perf_group *g, int cpu, pid_t pid, char *err, size_t errlen
 			continue;
 		if (!g->hw && e < EV_TASK_CLOCK)
 			continue;
-		if (e == EV_L2_MISSES && !l2_for_cpu(cpu))
-			continue;	/* no L2 event for this core type */
+		if (is_raw(e) && !raw_for_cpu(e, cpu))
+			continue;	/* no code for this core type */
 		/*
 		 * A missing member is not fatal: some PMUs lack the dTLB or
 		 * LLC events, and the monitor reports which checks it had
@@ -425,6 +442,16 @@ int perf_read_interval(struct perf_group *g, int64_t out[EV_NR],
 	g->prev_enabled = buf[1];
 	g->prev_running = buf[2];
 	g->running = den ? (double)drun / (double)den : 0;
+	if (den && !drun && !g->warned) {
+		/*
+		 * Enabled but never scheduled: the group needs more counters
+		 * than this core's PMU has, or another user holds them all.
+		 */
+		snprintf(err, errlen, "cpu%d: counter group not scheduled "
+			 "(too many events for this PMU, or counters in use)", g->cpu);
+		g->warned = true;
+		return -2;
+	}
 	scale = drun ? (double)den / (double)drun : 0;
 
 	for (i = 0; i < buf[0] && 4 + 2 * i < (uint64_t)n / sizeof(uint64_t); i++) {

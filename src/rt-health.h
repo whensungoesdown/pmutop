@@ -51,7 +51,10 @@ struct cpu_sample {
 	double		busy;		/* 0..1, from ref-cycles: includes EVL; NAN if unknown */
 	double		ipc;
 	double		llc_mpki;
-	double		l2_mpki;	/* L2 demand data read misses / 1000 instr */
+	double		l2_mpki;	/* L2 misses / 1000 instr */
+	double		l1d_mpki;	/* L1D misses (retired loads) / 1000 instr */
+	double		l1i_mpki;
+	double		itlb_mpki;
 	double		tlb_mpki;
 	double		cache_mpki;
 	double		stall_pct;

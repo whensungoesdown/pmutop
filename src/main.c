@@ -153,12 +153,19 @@ static void derive(struct cpu_sample *s, const uint64_t cur[8],
 			(double)s->ev[EV_LLC_MISSES] * 1000.0 / ins : NAN;
 		s->l2_mpki = s->ev_ok[EV_L2_MISSES] ?
 			(double)s->ev[EV_L2_MISSES] * 1000.0 / ins : NAN;
+		s->l1d_mpki = s->ev_ok[EV_L1D_MISSES] ?
+			(double)s->ev[EV_L1D_MISSES] * 1000.0 / ins : NAN;
+		s->l1i_mpki = s->ev_ok[EV_L1I_MISSES] ?
+			(double)s->ev[EV_L1I_MISSES] * 1000.0 / ins : NAN;
+		s->itlb_mpki = s->ev_ok[EV_ITLB_MISSES] ?
+			(double)s->ev[EV_ITLB_MISSES] * 1000.0 / ins : NAN;
 		s->tlb_mpki = s->ev_ok[EV_DTLB_MISSES] ?
 			(double)s->ev[EV_DTLB_MISSES] * 1000.0 / ins : NAN;
 		s->cache_mpki = s->ev_ok[EV_CACHE_MISSES] ?
 			(double)s->ev[EV_CACHE_MISSES] * 1000.0 / ins : NAN;
 	} else {
 		s->llc_mpki = s->l2_mpki = s->tlb_mpki = s->cache_mpki = NAN;
+		s->l1d_mpki = s->l1i_mpki = s->itlb_mpki = NAN;
 	}
 
 	if (s->ev_ok[EV_STALL_MEM] && s->ev_ok[EV_CYCLES] && s->ev[EV_CYCLES] > 0)
@@ -230,21 +237,26 @@ int main(int argc, char **argv)
 	struct telem tel;
 	FILE *csv = NULL;
 	char err[256];
-	const char *cpus_arg = NULL, *l2_spec = NULL;
-	char l2_msg[160] = "";
+	const char *cpus_arg = NULL, *l2_spec = NULL, *l1d_spec = NULL;
+	const char *show = NULL;
+	char raw_msg[160] = "";
 	int i, c, iter, ret;
 	static const struct option lopts[] = {
 		{ "graphic", no_argument, NULL, 'g' },
 		{ "l2-event", required_argument, NULL, 'L' },
+		{ "l1d-event", required_argument, NULL, 'D' },
+		{ "show", required_argument, NULL, 's' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	/* _only: "-graphic" works as well as "--graphic" and "-g" */
-	while ((c = getopt_long_only(argc, argv, "c:gi:L:n:o:p:t:vh", lopts, NULL)) != -1) {
+	while ((c = getopt_long_only(argc, argv, "c:D:gi:L:n:o:p:s:t:vh", lopts, NULL)) != -1) {
 		switch (c) {
 		case 'g': o.graphic = true; break;
 		case 'L': l2_spec = optarg; break;
+		case 'D': l1d_spec = optarg; break;
+		case 's': show = optarg; break;
 		case 'c': cpus_arg = optarg; break;
 		case 'i': o.interval_ms = atoi(optarg); break;
 		case 'n': o.count = atoi(optarg); break;
@@ -259,8 +271,10 @@ int main(int argc, char **argv)
 				" [-o out.csv] [-t telemetry.bin] [-graphic]\n"
 				"  -graphic  full-screen charts"
 				" (keys: q quit, p pause, c clear events)\n"
-				"  --l2-event PMU:CONFIG[,PMU:CONFIG]  raw L2-miss event per core type"
-				" (built in for Core Ultra 200H)\n"
+				"  --show LIST  charts for -graphic, in order:"
+				" frame,cpu,pf,l1i,l1d,l2,itlb,dtlb (default all)\n"
+				"  --l2-event / --l1d-event PMU:CONFIG[,PMU:CONFIG]"
+				"  raw event per core type (built in for Core Ultra 200H)\n"
 				"  Default CPU list: /sys/devices/system/cpu/isolated.\n"
 				"  CPU-wide counters need root and a working PMU;\n"
 				"  without them the /proc and sysfs signals remain.\n");
@@ -310,13 +324,32 @@ int main(int argc, char **argv)
 	if (ref_hz <= 0)
 		fprintf(stderr, "no ref-cycles counter: busy%% unavailable\n");
 
-	/* L2 events are per core type; a core without one just has no L2 data. */
-	if (perf_setup_l2(l2_spec, l2_msg, sizeof(l2_msg)) == 0 || l2_msg[0])
-		fprintf(stderr, "L2 misses: %s\n", l2_msg[0] ? l2_msg : "no event configured");
-	for (i = 0; i < o.nr_cpus; i++)
-		if (o.cpus[i] >= 0 && !perf_l2_covers(o.cpus[i]))
-			fprintf(stderr, "cpu%d: no L2-miss event for this core type\n", o.cpus[i]);
+	/*
+	 * L2 and L1D misses are raw events, per core type; a core without a
+	 * code for its type just has no data for that chart.
+	 */
+	{
+		const struct { int ev; const char *what; const char *spec; } rawv[] = {
+			{ EV_L2_MISSES, "L2", l2_spec },
+			{ EV_L1D_MISSES, "L1D", l1d_spec },
+		};
 
+		for (unsigned k = 0; k < sizeof(rawv) / sizeof(rawv[0]); k++) {
+			if (perf_setup_raw(rawv[k].ev, rawv[k].spec, raw_msg, sizeof(raw_msg)) == 0 ||
+			    raw_msg[0])
+				fprintf(stderr, "%s misses: %s\n", rawv[k].what,
+					raw_msg[0] ? raw_msg : "no event configured");
+			for (i = 0; i < o.nr_cpus; i++)
+				if (o.cpus[i] >= 0 && !perf_raw_covers(rawv[k].ev, o.cpus[i]))
+					fprintf(stderr, "cpu%d: no %s-miss event for this core type\n",
+						o.cpus[i], rawv[k].what);
+		}
+	}
+
+	if (o.graphic && ui_select(show, err, sizeof(err)) < 0) {
+		fprintf(stderr, "--show: %s\n", err);
+		return 2;
+	}
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
@@ -369,7 +402,8 @@ int main(int argc, char **argv)
 		}
 		fprintf(csv, "t_s,cpu,state,util,ipc,llc_mpki,dtlb_mpki,"
 			     "cache_mpki,stall_pct,irq_rate,irq_timer,irq_thermal,"
-			     "irq_ipi,irq_device,freq_mhz,temp_c,busy,page_faults,l2_mpki\n");
+			     "irq_ipi,irq_device,freq_mhz,temp_c,busy,page_faults,l2_mpki,"
+			     "l1d_mpki,l1i_mpki,itlb_mpki\n");
 	}
 
 	if (o.graphic) {
@@ -424,9 +458,18 @@ int main(int argc, char **argv)
 			char note[160] = "";
 
 			if (cs[i].perf_ok) {
-				if (perf_read_interval(&pg[i], ev, ok, err, sizeof(err)) == 0) {
+				int rr = perf_read_interval(&pg[i], ev, ok, err, sizeof(err));
+
+				if (rr == 0) {
 					memcpy(cs[i].ev, ev, sizeof(ev));
 					memcpy(cs[i].ev_ok, ok, sizeof(ok));
+				} else if (rr == -2) {
+					/* not scheduled this time: say so once, keep trying */
+					if (o.graphic)
+						ui_event("%s", err);
+					else
+						fprintf(stderr, "%s\n", err);
+					memset(cs[i].ev_ok, 0, sizeof(cs[i].ev_ok));
 				} else {
 					fprintf(stderr, "cpu%d: %s; PMU disabled\n",
 						cs[i].cpu, err);
@@ -485,7 +528,8 @@ int main(int argc, char **argv)
 
 			if (csv)
 				fprintf(csv, "%.3f,%d,%s,%.4f,%.3f,%.3f,%.3f,%.3f,"
-					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f,%lld,%.4f\n",
+					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f,%lld,%.4f,"
+					"%.4f,%.4f,%.4f\n",
 					now / 1e9, cs[i].cpu,
 					health_str(met[i].health), met[i].util,
 					met[i].ipc, met[i].llc_mpki, met[i].tlb_mpki,
@@ -498,7 +542,8 @@ int main(int argc, char **argv)
 					met[i].freq_mhz, met[i].temp_c, met[i].busy,
 					cs[i].ev_ok[EV_PAGE_FAULT] ?
 						(long long)cs[i].ev[EV_PAGE_FAULT] : -1LL,
-					cs[i].l2_mpki);
+					cs[i].l2_mpki, cs[i].l1d_mpki,
+					cs[i].l1i_mpki, cs[i].itlb_mpki);
 		}
 
 		if (o.graphic && !ui_paused())
