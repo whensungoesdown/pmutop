@@ -58,7 +58,7 @@ struct cpu_sample {
 	double		l1i_mpki;
 	double		itlb_mpki;
 	double		tlb_mpki;
-	double		cache_mpki;
+	double		l3_mpki;	/* loads served from DRAM (missed L3) / 1000 instr */
 	double		stall_pct;
 	uint64_t	irq_rate;	/* interrupts per second on this core */
 };

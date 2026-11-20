@@ -6,9 +6,10 @@ pmutop reads each core's PMU (performance monitoring unit) through the Linux `pe
 
 - CPU usage measured by the hardware, and the average clock while awake
 - IPC (instructions per cycle)
-- L1 instruction, L1 data and L2 cache misses
+- L1 instruction, L1 data, L2 and L3 cache misses
 - instruction and data TLB misses
 - page faults, and interrupts by source
+- chip-wide: the uncore clocks and DRAM read/write bandwidth
 
 From these you can usually tell whether a core is limited by memory, by instruction fetch, by address translation, by its clock, or by interrupts. pmutop also learns each core's normal level and warns when a core departs from it.
 
@@ -79,7 +80,7 @@ Only the Core Ultra 200H has been tested. Charts without an event show `-` or st
 
 ### Adding event codes for your CPU
 
-L1I, L1D and L2 misses need model-specific codes, one per core type. To find them:
+L1I, L1D, L2 and L3 misses need model-specific codes, one per core type. To find them:
 
 1. **List the PMUs.** `ls /sys/bus/event_source/devices/`. Non-hybrid x86 CPUs have one, `cpu`; Intel hybrids have `cpu_core`, `cpu_atom` and sometimes `cpu_lowpower`.
 2. **Find the events.** `perf list --details` lists them with their encoding. Good candidates on Intel are `mem_load_retired.l1_miss` (L1D), `l2_rqsts.demand_data_rd_miss` (L2) and `frontend_retired.l1i_miss` (L1I); E-cores use `mem_load_uops_retired.*` and `frontend_retired.icache`. For example:
@@ -130,7 +131,7 @@ How to show it:
   -g, --graphic          full-screen charts (default on a terminal)
   -b, --batch            one text line per core per sample
   -s, --show=LIST        charts in the full-screen view, in this order
-                         (default: all): cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb,frame
+                         (default: all): cpu,ipc,pf,l1i,l1d,l2,l3,itlb,dtlb,frame
   -i, --interval=MS      sampling interval in milliseconds (default 1000)
   -n, --count=N          stop after N samples (default: until q or Ctrl-C)
   -o, --csv=FILE         also write every sample to FILE
@@ -143,6 +144,7 @@ built in for Intel Core Ultra 200H):
       --l1i-event=SPEC   L1 instruction-cache misses
       --l1d-event=SPEC   L1 data-cache misses
       --l2-event=SPEC    L2 cache misses
+      --l3-event=SPEC    L3 misses (loads served from DRAM)
 
   -h, --help             show this help
   -V, --version          show the version
@@ -168,7 +170,7 @@ Each core gets a panel. Within a panel, each metric is a scrolling bar chart sev
 
 - **▲ grows up, higher is better:** IPC (fixed range 0–5).
 - **■ grows up, neutral:** CPU usage (0–100 %).
-- **▼ hangs down from the top, lower is better:** page faults, L1I, L1D and L2 misses, iTLB and dTLB misses, and worst frame time when `-t` is used.
+- **▼ hangs down from the top, lower is better:** page faults, L1I, L1D, L2 and L3 misses, iTLB and dTLB misses, and worst frame time when `-t` is used.
 - **Panel header:** state (OK / WARN / FAIL), CPU usage, measured clock, temperature, interrupts per second by source, and the reason when the state is not OK.
 - **Isolated cores** are marked with a magenta `ISOLATED` tag, a magenta core number and heavy magenta dividers.
 - **Event log** (bottom): state changes with time and reason, newest first.
@@ -186,6 +188,7 @@ All rate charts are **counts per second on a linear scale**. Each has four range
 | L1I miss/s | 10k, 100k, 1M, 10M |
 | L1D miss/s | 50k, 500k, 5M, 50M |
 | L2 miss/s | 10k, 100k, 1M, 20M |
+| L3 miss/s | 1k, 10k, 100k, 2M |
 | iTLB miss/s | 5k, 50k, 500k, 5M |
 | dTLB miss/s | 1k, 10k, 1M, 20M |
 
@@ -201,6 +204,7 @@ Each sample is drawn on the smallest range that covers the last 10 samples. The 
 | L1I miss/s | > 20k | > 100k | isolated cores |
 | L1D miss/s | > 200k | > 1M | isolated cores |
 | L2 miss/s | > 50k | > 100k | isolated cores |
+| L3 miss/s | > 2k | > 20k | isolated cores |
 | iTLB miss/s | > 10k | > 50k | isolated cores |
 | dTLB miss/s | > 1k | > 5k | isolated cores |
 | worst frame µs | > 500 | > 900 | isolated cores (1 ms period) |
@@ -219,7 +223,7 @@ With `--batch`, or when the output is not a terminal, pmutop prints one line per
 | `cpu%` | CPU usage from the hardware (see [below](#cpu-usage)); Linux's `/proc/stat` figure only when no PMU is available |
 | `MHz` | Average clock while the core was awake, measured |
 | `IPC` | Instructions per cycle |
-| `LLC/K`, `dTLB/K`, `cache/K` | Last-level-cache, dTLB and all-cache misses per 1000 instructions |
+| `LLC/K`, `dTLB/K`, `L3/K` | Generic last-level-cache misses, dTLB misses and L3 misses (loads served from DRAM) per 1000 instructions |
 | `stall%` | Back-end stall cycles; `-` where the CPU has no generic event for it (most Intel cores) |
 | `IRQ/s` | Interrupts per second on this core |
 | `temp` | Temperature, °C (package sensor) |
@@ -227,9 +231,9 @@ With `--batch`, or when the output is not a terminal, pmutop prints one line per
 
 The CSV (`-o`) has one row per core per sample with these columns:
 
-`t_s, cpu, state, util, ipc, llc_mpki, dtlb_mpki, cache_mpki, stall_pct, irq_rate, irq_timer, irq_thermal, irq_ipi, irq_device, freq_mhz, temp_c, busy, page_faults, l2_mpki, l1d_mpki, l1i_mpki, itlb_mpki`
+`t_s, cpu, state, util, ipc, llc_mpki, dtlb_mpki, l3_mpki, stall_pct, irq_rate, irq_timer, irq_thermal, irq_ipi, irq_device, freq_mhz, temp_c, busy, page_faults, l2_mpki, l1d_mpki, l1i_mpki, itlb_mpki, uncore_cncu_ghz, uncore_sncu_ghz, dram_read_gbs, dram_write_gbs`
 
-`util` is Linux's figure and `busy` the hardware one, both 0–1. `*_mpki` are misses per 1000 instructions. The `irq_*` class columns are counts per interval, not per second.
+`util` is Linux's figure and `busy` the hardware one, both 0–1. The last four columns are chip-wide and repeat on every row of a sample. In text mode they are printed as one `uncore:` line before each sample's core lines. `*_mpki` are misses per 1000 instructions. The `irq_*` class columns are counts per interval, not per second.
 
 ## How pmutop measures
 
@@ -245,7 +249,7 @@ All events of a core are in one group and are read with a single `read()` of the
 
 Groups are not pinned. If another user (perf, a second pmutop) also needs the counters, the kernel time-shares them, and pmutop scales each value by enabled time / running time to estimate the whole interval. A pinned group would instead go into an error state and read zero from then on.
 
-A group must also fit in the core's counters, or the kernel never schedules it and every event reads nothing. pmutop keeps its group at 7 programmable events plus the fixed counters, which fits on all core types of the reference CPU. If a group is never scheduled, pmutop says so once (`counter group not scheduled`) rather than showing zeros.
+A group must also fit in the core's counters, or the kernel never schedules it and every event reads nothing. pmutop keeps its group at 8 programmable events on P-cores and 7 on E-cores, plus the fixed counters, which fits on all core types of the reference CPU. (Going from 7 to 8 on E-cores made the whole group unschedulable, so the unused generic cache-misses event was dropped.) If a group is never scheduled, pmutop says so once (`counter group not scheduled`) rather than showing zeros.
 
 ### CPU usage
 
@@ -276,6 +280,7 @@ Generic perf events cover cycles, instructions, last-level cache, dTLB and iTLB.
 | Metric | P-cores (`cpu_core`) | E-cores and LP E-cores (`cpu_atom`, `cpu_lowpower`) |
 |---|---|---|
 | L2 miss | `L2_RQSTS.DEMAND_DATA_RD_MISS` 0x2124 | `MEM_LOAD_UOPS_RETIRED.L2_MISS` 0x80d1 |
+| L3 miss | `MEM_LOAD_RETIRED.L3_MISS` 0x20d1 | derived: L2 miss − `MEM_LOAD_UOPS_RETIRED.L3_HIT` (0x1cd1); none on LP E-cores |
 | L1D miss | `MEM_LOAD_RETIRED.L1_MISS` 0x08d1 | `MEM_LOAD_UOPS_RETIRED.L1_MISS` 0x40d1 |
 | L1I miss | `FRONTEND_RETIRED.L1I_MISS` 0x03c6, frontend 0x12 (config1) | `FRONTEND_RETIRED.ICACHE` 0x20c6 |
 | iTLB miss | generic → `ITLB_MISSES.WALK_COMPLETED` | generic → `ITLB.MISS` |
@@ -286,7 +291,26 @@ Notes:
 - **L1D and L1I count retired instructions.** L1D counts loads that missed L1D; L1I counts instructions fetched after an L1I miss. Prefetches and wrong-path fetches are excluded, so these are the misses that actually affect execution, and P- and E-cores measure the same thing. The generic P-core L1I event (`L2_RQSTS.ALL_CODE_RD`) counts every code request sent to L2, including prefetches. That read 5–8× the real misses and was not used.
 - **L2 differs slightly between core types.** On P-cores the event counts demand data-read requests that missed L2, on E-cores retired loads that missed L2. Compare P- and E-core L2 numbers with care.
 - **LP E-cores** have no event table in perf; they share the E-core design, and the E-core codes are used.
+- **L3 misses** count loads served from DRAM. E-cores have no event for that, so pmutop counts their L2 misses and L3 hits and subtracts, using one extra counter instead of two. The LP E-cores are outside the L3, so they have no L3 chart data.
 - **Other CPUs.** Give the codes with `--l2-event`, `--l1d-event` and `--l1i-event`, one `PMU:config[:config1]` per core type, for example `--l1i-event cpu_core:0x03c6:0x12,cpu_atom:0x20c6`. See [Adding event codes for your CPU](#adding-event-codes-for-your-cpu). A core whose type has no code shows no data for that chart; everything else still works.
+
+### Uncore: chip-wide clocks and memory bandwidth
+
+Besides the per-core counters, pmutop reads a few chip-wide ("uncore") counters once per interval and shows them on the second line of the full-screen view, for example:
+
+```
+ uncore:  cncu 2.15 GHz  sncu 1.06 GHz   DRAM read 0.08 GB/s  write 0.10 GB/s
+```
+
+| Value | Source | Meaning |
+|---|---|---|
+| `cncu` | `uncore_cncu/clockticks` | Average frequency of the uncore clock the `intel_uncore_frequency` driver controls, most likely the ring and L3 |
+| `sncu` | `uncore_sncu/clockticks` | Average frequency of a second uncore clock domain, which rises with memory traffic |
+| DRAM read / write | `uncore_imc_free_running_*/data_read`, `data_write` | Bytes moved by the memory controllers, summed over all of them |
+
+These use the uncore PMUs, not the cores', so they cost no core counters, and the DRAM counters are free-running. Events, units and scale are read from sysfs, so a machine without these PMUs simply omits the line.
+
+How the clock values were checked on the reference machine: capping the uncore frequency to 2.0 GHz through `/sys/devices/system/cpu/intel_uncore_frequency/*/max_freq_khz` capped `cncu` at exactly 2.00 G ticks/s. `sncu` ran on at 2.19 G/s, so it is a separate domain. It rose from about 0.9 to about 2.1 G/s under memory traffic, but not under compute-only load. Which hardware units the two clocks drive is not documented for this CPU, so the kernel's names are shown. The driver's `current_freq_khz` is not a reliable alternative: it read 3.9 GHz while the counter averaged 2 GHz on an idle machine.
 
 ## Warnings
 
@@ -416,6 +440,8 @@ All results are from the reference machine: Lenovo ThinkBook 16 G7+ IAH, Intel C
 |---|---|---|
 | Event values | pmutop and `perf stat` on the same core at the same time, 512 MiB random pointer chase | L2/K: P-core 16.20 vs 16.57, E-core 16.67 vs 16.24, LP E-core 26.92 vs 26.96. L1D/K: P 71.7 vs 72.7, E 103.6 vs 106.2. iTLB/K: P 0.96 vs 0.92, E 0.66 vs 0.71. L1I/K (P-core, light load): 0.18–0.21 vs 0.17–0.20 |
 | Counter sharing | Two pmutop instances and perf counting the same cores at once | Both instances kept reading; L2/K 10.0 and 1.50 vs 9.46 and 1.58 with perf alone |
+| L3 misses | pmutop and perf at the same time, 512 MiB random pointer chase | L3/K: P-core 65.0 vs 66.2 (`mem_load_retired.l3_miss`); E-core 83.2 vs 83.8 (L2 miss − L3 hit) |
+| DRAM bandwidth and uncore clocks | pmutop and perf over the same 10 s window, memory stress on 4 cores | read 12.4 vs 13.6 GB/s, write 8.7 vs 9.4 GB/s. The uncore clock varies from run to run with load (perf saw cncu 3.2–3.9 GHz in different runs), so compare only simultaneous readings |
 | CPU usage | Known loads | Idle 0.6–0.7 %; 1 ms real-time loop 2.0–3.0 % (Linux: 0 %); 50 % Linux task 55.8 % (Linux: 50.5 %) |
 | No false alarms | Real-time loop on isolated cores for 60 s, memory and cache stress on the other cores | 114 of 114 samples OK |
 | Device-interrupt detection | Wi-Fi interrupt moved onto an isolated core, with traffic | Warned from the first sample, naming `IRQ 183: iwlwifi:default_queue`; OK again after restoring |
@@ -435,6 +461,7 @@ src/sysfs.c           /proc/stat, /proc/interrupts (by source), cpufreq, cpuidle
 src/metrics.c, .h     ratios, median/MAD baselines, warning rules
 src/ui.c, ui.h        full-screen view: panel grid, pages, charts (ANSI escape sequences, no curses)
 src/telemetry.c, .h   read-only view of frame telemetry
+src/uncore.c, .h      chip-wide counters: uncore clocks, DRAM bandwidth
 src/pmutop.h          shared sample structure
 telemetry/rt_frames.h publishing side for real-time tasks (header only)
 scripts/mock_rt.c     stand-in real-time producer

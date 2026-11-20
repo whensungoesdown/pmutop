@@ -38,7 +38,7 @@ struct metrics {
 	double		llc_mpki;
 	double		l2_mpki;
 	double		tlb_mpki;
-	double		cache_mpki;
+	double		l3_mpki;
 	double		stall_pct;
 	double		irq_rate;
 	double		freq_mhz;

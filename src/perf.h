@@ -14,7 +14,6 @@
 enum {
 	EV_CYCLES = 0,
 	EV_INSTRUCTIONS,
-	EV_CACHE_MISSES,
 	EV_LLC_MISSES,
 	EV_DTLB_MISSES,
 	EV_ITLB_MISSES,
@@ -23,6 +22,13 @@ enum {
 	EV_L2_MISSES,		/* model-specific raw event, see perf_setup_raw() */
 	EV_L1D_MISSES,		/* model-specific raw event, see perf_setup_raw() */
 	EV_L1I_MISSES,		/* model-specific raw event, see perf_setup_raw() */
+	/*
+	 * Loads served from DRAM, i.e. that missed L3.  P-cores count it
+	 * directly; E-cores have no such event, so it is their L2 misses
+	 * minus L3 hits, and EV_L3_HITS exists only for that subtraction.
+	 */
+	EV_L3_MISSES,		/* model-specific raw event, see perf_setup_raw() */
+	EV_L3_HITS,		/* E-cores only; see EV_L3_MISSES */
 	EV_TASK_CLOCK,		/* software: only meaningful for a thread */
 	EV_CTX_SWITCH,		/* software: a thread leaving the OOB stage */
 	EV_PAGE_FAULT,		/* software: a thread faulting and demoting */

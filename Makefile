@@ -4,7 +4,7 @@ CFLAGS	?= -O2 -g -Wall -Wextra -std=gnu11
 CPPFLAGS += -Isrc -Itelemetry
 LDLIBS	+= -lm
 
-SRCS	:= src/main.c src/perf.c src/sysfs.c src/metrics.c src/telemetry.c src/ui.c
+SRCS	:= src/main.c src/perf.c src/sysfs.c src/metrics.c src/telemetry.c src/ui.c src/uncore.c
 OBJS	:= $(SRCS:.c=.o)
 
 all: pmutop

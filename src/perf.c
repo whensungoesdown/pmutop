@@ -44,8 +44,6 @@ static struct ev_desc ev_tab[] = {
 			     "cycles" },
 	[EV_INSTRUCTIONS] = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS,
 			      "instructions" },
-	[EV_CACHE_MISSES] = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES,
-			      "cache/read/miss" },
 	[EV_LLC_MISSES]	 = { PERF_TYPE_HW_CACHE,
 			     PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8)
 			     | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
@@ -75,6 +73,8 @@ static struct ev_desc ev_tab[] = {
 	[EV_L2_MISSES]	 = { 0, 0, "L2 miss (per-PMU raw event)" },
 	[EV_L1D_MISSES]	 = { 0, 0, "L1D miss (per-PMU raw event)" },
 	[EV_L1I_MISSES]	 = { 0, 0, "L1I miss (per-PMU raw event)" },
+	[EV_L3_MISSES]	 = { 0, 0, "L3 miss (per-PMU raw event)" },
+	[EV_L3_HITS]	 = { 0, 0, "L3 hit (per-PMU raw event)" },
 	[EV_TASK_CLOCK]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK,
 			     "task-clock" },
 	[EV_CTX_SWITCH]	 = { PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES,
@@ -191,8 +191,15 @@ static int cpu_model(void)
  *             E  cpu_atom      MEM_LOAD_UOPS_RETIRED.L1_MISS   0x40d1
  *   L1I miss  P  cpu_core      FRONTEND_RETIRED.L1I_MISS       0x03c6, frontend 0x12
  *             E  cpu_atom      FRONTEND_RETIRED.ICACHE         0x20c6
+ *   L3 miss   P  cpu_core      MEM_LOAD_RETIRED.L3_MISS        0x20d1
+ *             E  cpu_atom      derived: L2 miss - L3 hit
+ *   L3 hit    E  cpu_atom      MEM_LOAD_UOPS_RETIRED.L3_HIT    0x1cd1
  *   LP E-cores (cpu_lowpower) share the E-core design; perf has no table
- *   for them and the E-core codes are used.
+ *   for them and the E-core codes are used.  They have no L3 of their
+ *   own, so there "L3 miss" is not meaningful and no code is given.
+ *
+ * The E-core L3 miss is retired loads that missed L2 and did not hit L3,
+ * which is what the P-core event counts directly.
  *
  * Both L1D events count retired loads that missed L1D, and both L1I
  * events retired instructions fetched after an L1I miss (prefetches and
@@ -220,6 +227,13 @@ static struct raw_ev {
 	[EV_L2_MISSES]	= { "cpu_core:0x2124,cpu_atom:0x80d1,cpu_lowpower:0x80d1" },
 	[EV_L1D_MISSES]	= { "cpu_core:0x08d1,cpu_atom:0x40d1,cpu_lowpower:0x40d1" },
 	[EV_L1I_MISSES]	= { "cpu_core:0x03c6:0x12,cpu_atom:0x20c6,cpu_lowpower:0x20c6" },
+	/*
+	 * E-cores: no EV_L3_MISSES code; perf_read_interval() derives it
+	 * as EV_L2_MISSES - EV_L3_HITS, which costs one counter instead of
+	 * two.
+	 */
+	[EV_L3_MISSES]	= { "cpu_core:0x20d1" },
+	[EV_L3_HITS]	= { "cpu_atom:0x1cd1" },
 };
 
 /*
@@ -475,6 +489,19 @@ int perf_read_interval(struct perf_group *g, int64_t out[EV_NR],
 			g->prev[e] = val;
 			break;
 		}
+	}
+
+	/*
+	 * Where the core type has no L3-miss event (E-cores), derive it:
+	 * loads that missed L2 and did not hit L3 went to DRAM.  Counts of
+	 * the same interval, so the difference is consistent; clamp at 0
+	 * against rounding of the time scaling.
+	 */
+	if (!g->open[EV_L3_MISSES] && ok[EV_L2_MISSES] && ok[EV_L3_HITS]) {
+		int64_t d = out[EV_L2_MISSES] - out[EV_L3_HITS];
+
+		out[EV_L3_MISSES] = d > 0 ? d : 0;
+		ok[EV_L3_MISSES] = true;
 	}
 	return 0;
 }

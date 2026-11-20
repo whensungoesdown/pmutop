@@ -115,7 +115,7 @@ void metrics_feed(struct metrics *m, const struct cpu_sample *s, double dt_s,
 	m->llc_mpki = s->llc_mpki;
 	m->l2_mpki = s->l2_mpki;
 	m->tlb_mpki = s->tlb_mpki;
-	m->cache_mpki = s->cache_mpki;
+	m->l3_mpki = s->l3_mpki;
 	m->stall_pct = s->stall_pct;
 	m->irq_rate = (double)s->irq_rate;
 	m->freq_mhz = isfinite(s->eff_mhz) ? s->eff_mhz : s->freq_khz / 1000.0;

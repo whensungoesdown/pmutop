@@ -4,6 +4,7 @@
 
 #include "pmutop.h"
 #include "metrics.h"
+#include "uncore.h"
 
 struct ui_info {
 	int		interval_ms;
@@ -22,7 +23,9 @@ void ui_draw(int nslots);
 /* Sleep up to @ms, serving the keyboard; returns 1 when the user quits. */
 int  ui_wait(int ms, int nslots);
 bool ui_paused(void);
-/* --show: chart keys (frame,cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb) or "all" */
+/* Chip-wide readings shown under the title bar. */
+void ui_uncore(const struct uncore_sample *u);
+/* --show: chart keys (frame,cpu,ipc,pf,l1i,l1d,l2,l3,itlb,dtlb) or "all" */
 int  ui_select(const char *spec, char *err, size_t errlen);
 
 #endif

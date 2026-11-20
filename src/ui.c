@@ -48,6 +48,7 @@ enum {
 	G_L1I,
 	G_L1D,
 	G_L2,
+	G_L3,
 	G_ITLB,
 	G_TLB,
 	G_FRAME,
@@ -105,6 +106,12 @@ static const struct graph_desc gd[G_NR] = {
 	 * 30k/s; a cache-hostile task: millions per second.
 	 */
 	[G_L2]    = { "L2 miss/s",       true,  false, false, 0,  100000,  NULL,   50000, 100000, { 10000, 100000, 1000000, 20000000 } },
+	/*
+	 * Loads served from DRAM.  Measured on the ThinkBook: idle or 1 ms
+	 * real-time loop 40-100/s, an LLM on the core 1.5k/s, a 512 MiB
+	 * random chase 1.9M/s.
+	 */
+	[G_L3]    = { "L3 miss/s",       true,  false, false, 0,  1000,    NULL,   2000,  20000,  { 1000, 10000, 100000, 2000000 } },
 	/* evl-pingpong: tens per second; a TLB-hostile task: millions */
 	/*
 	 * L1 and iTLB, measured on the ThinkBook (per second):
@@ -472,6 +479,8 @@ void ui_push(int slot, const struct cpu_sample *s, const struct metrics *m,
 	h->v[G_IPC][i] = m->ipc;
 	h->v[G_PF][i] = s->ev_ok[EV_PAGE_FAULT] && dt > 0 ?
 			s->ev[EV_PAGE_FAULT] / dt : NAN;
+	h->v[G_L3][i] = s->ev_ok[EV_L3_MISSES] && dt > 0 ?
+			s->ev[EV_L3_MISSES] / dt : NAN;
 	h->v[G_L2][i] = s->ev_ok[EV_L2_MISSES] && dt > 0 ?
 			s->ev[EV_L2_MISSES] / dt : NAN;
 	h->v[G_TLB][i] = s->ev_ok[EV_DTLB_MISSES] && dt > 0 ?
@@ -674,7 +683,7 @@ static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, in
 /* Charts to show, in order; set by ui_select() (--show). */
 static const struct { const char *key; int g; } chart_keys[] = {
 	{ "frame", G_FRAME }, { "cpu", G_BUSY }, { "ipc", G_IPC }, { "pf", G_PF },
-	{ "l1i", G_L1I }, { "l1d", G_L1D }, { "l2", G_L2 },
+	{ "l1i", G_L1I }, { "l1d", G_L1D }, { "l2", G_L2 }, { "l3", G_L3 },
 	{ "itlb", G_ITLB }, { "dtlb", G_TLB },
 };
 #define NKEYS	((int)(sizeof(chart_keys) / sizeof(chart_keys[0])))
@@ -798,6 +807,12 @@ static int charts_shown(void)
 #define MIN_CHART_ROWS	3	/* title + 2 rows of bars */
 
 static int page;		/* current page when not all panels fit */
+static struct uncore_sample unc = { NAN, NAN, NAN, NAN };
+
+void ui_uncore(const struct uncore_sample *u)
+{
+	unc = *u;
+}
 
 void ui_draw(int nslots)
 {
@@ -867,10 +882,29 @@ void ui_draw(int nslots)
 		if (cols > (int)strlen(title) + kw)
 			put_text(0, cols - kw, kw, keys, A_REV);
 	}
-	put_text(1, 0, cols,
-		 " \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
-		 "   bar colour = range it was drawn on: green < light blue < blue < magenta;"
-		 " yellow/red = high/too high", C_DIM);
+	/*
+	 * Second row: chip-wide uncore readings when there are any, else a
+	 * reminder of how to read the charts.
+	 */
+	if (isfinite(unc.cncu_ghz) || isfinite(unc.dram_rd_gbs)) {
+		char ul[200];
+		int n = 0;
+
+		n += snprintf(ul + n, sizeof(ul) - n, " uncore:");
+		if (isfinite(unc.cncu_ghz))
+			n += snprintf(ul + n, sizeof(ul) - n, "  cncu %.2f GHz", unc.cncu_ghz);
+		if (isfinite(unc.sncu_ghz))
+			n += snprintf(ul + n, sizeof(ul) - n, "  sncu %.2f GHz", unc.sncu_ghz);
+		if (isfinite(unc.dram_rd_gbs))
+			snprintf(ul + n, sizeof(ul) - n, "   DRAM read %.2f GB/s  write %.2f GB/s",
+				 unc.dram_rd_gbs, unc.dram_wr_gbs);
+		put_text(1, 0, cols, ul, C_CYAN | A_BOLD);
+	} else {
+		put_text(1, 0, cols,
+			 " \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
+			 "   bar colour = range it was drawn on: green < light blue < blue < magenta;"
+			 " yellow/red = high/too high", C_DIM);
+	}
 
 	for (i = first; i < last; i++) {
 		int k = i - first, pr = k / cpr, pc = k % cpr;

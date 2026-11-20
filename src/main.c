@@ -27,6 +27,7 @@
 #include "metrics.h"
 #include "telemetry.h"
 #include "ui.h"
+#include "uncore.h"
 
 struct opt {
 	int	interval_ms;
@@ -80,7 +81,7 @@ static int64_t now_ns(void)
 }
 
 /* Long-only options. */
-enum { OPT_L1I = 256, OPT_L1D, OPT_L2 };
+enum { OPT_L1I = 256, OPT_L1D, OPT_L2, OPT_L3 };
 
 static void usage(FILE *f)
 {
@@ -100,7 +101,7 @@ static void usage(FILE *f)
 "  -g, --graphic          full-screen charts (default on a terminal)\n"
 "  -b, --batch            one text line per core per sample\n"
 "  -s, --show=LIST        charts in the full-screen view, in this order\n"
-"                         (default: all): cpu,ipc,pf,l1i,l1d,l2,itlb,dtlb,frame\n"
+"                         (default: all): cpu,ipc,pf,l1i,l1d,l2,l3,itlb,dtlb,frame\n"
 "  -i, --interval=MS      sampling interval in milliseconds (default 1000)\n"
 "  -n, --count=N          stop after N samples (default: until q or Ctrl-C)\n"
 "  -o, --csv=FILE         also write every sample to FILE\n"
@@ -113,6 +114,7 @@ static void usage(FILE *f)
 "      --l1i-event=SPEC   L1 instruction-cache misses\n"
 "      --l1d-event=SPEC   L1 data-cache misses\n"
 "      --l2-event=SPEC    L2 cache misses\n"
+"      --l3-event=SPEC    L3 misses (loads served from DRAM)\n"
 "\n"
 "  -h, --help             show this help\n"
 "  -V, --version          show the version\n"
@@ -253,10 +255,10 @@ static void derive(struct cpu_sample *s, const uint64_t cur[8],
 			(double)s->ev[EV_ITLB_MISSES] * 1000.0 / ins : NAN;
 		s->tlb_mpki = s->ev_ok[EV_DTLB_MISSES] ?
 			(double)s->ev[EV_DTLB_MISSES] * 1000.0 / ins : NAN;
-		s->cache_mpki = s->ev_ok[EV_CACHE_MISSES] ?
-			(double)s->ev[EV_CACHE_MISSES] * 1000.0 / ins : NAN;
+		s->l3_mpki = s->ev_ok[EV_L3_MISSES] ?
+			(double)s->ev[EV_L3_MISSES] * 1000.0 / ins : NAN;
 	} else {
-		s->llc_mpki = s->l2_mpki = s->tlb_mpki = s->cache_mpki = NAN;
+		s->llc_mpki = s->l2_mpki = s->tlb_mpki = s->l3_mpki = NAN;
 		s->l1d_mpki = s->l1i_mpki = s->itlb_mpki = NAN;
 	}
 
@@ -284,7 +286,7 @@ static void print_header(void)
 {
 	printf("%-4s %-5s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
 	       "cpu", "state", "cpu%", "MHz", "IPC", "LLC/K", "dTLB/K",
-	       "cache/K", "stall%", "IRQ/s", "temp", "note");
+	       "L3/K", "stall%", "IRQ/s", "temp", "note");
 }
 
 static void fmt_or_dash(char *b, size_t n, double v, const char *fmt)
@@ -297,11 +299,11 @@ static void fmt_or_dash(char *b, size_t n, double v, const char *fmt)
 
 static void print_row(const struct cpu_sample *s, const struct metrics *m)
 {
-	char llc[16], tlb[16], cach[16], ipc[16], stall[16], tmp[16], busy[16];
+	char llc[16], tlb[16], l3[16], ipc[16], stall[16], tmp[16], busy[16];
 
 	fmt_or_dash(llc, sizeof(llc), s->llc_mpki, "%.2f");
 	fmt_or_dash(tlb, sizeof(tlb), s->tlb_mpki, "%.2f");
-	fmt_or_dash(cach, sizeof(cach), s->cache_mpki, "%.2f");
+	fmt_or_dash(l3, sizeof(l3), s->l3_mpki, "%.2f");
 	fmt_or_dash(ipc, sizeof(ipc), s->ipc, "%.2f");
 	fmt_or_dash(stall, sizeof(stall), s->stall_pct, "%.1f");
 	fmt_or_dash(tmp, sizeof(tmp), m->temp_c, "%.1f");
@@ -314,7 +316,7 @@ static void print_row(const struct cpu_sample *s, const struct metrics *m)
 
 	printf("%-4d %-5s %6s %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
 	       s->cpu, health_str(m->health), busy, m->freq_mhz,
-	       ipc, llc, tlb, cach, stall,
+	       ipc, llc, tlb, l3, stall,
 	       (unsigned long long)s->irq_rate, tmp, m->why);
 }
 
@@ -327,9 +329,11 @@ int main(int argc, char **argv)
 	uint64_t prevstat[MAX_CPUS][8], curstat[8];
 	int64_t prev_ns, now;
 	struct telem tel = { .fd = -1 };
+	struct uncore_sample unc;
 	FILE *csv = NULL;
 	char err[256];
 	const char *cpus_arg = "all", *l2_spec = NULL, *l1d_spec = NULL, *l1i_spec = NULL;
+	const char *l3_spec = NULL;
 	const char *show = NULL;
 	char raw_msg[160] = "";
 	enum { VIEW_AUTO, VIEW_GRAPHIC, VIEW_BATCH } view = VIEW_AUTO;
@@ -348,6 +352,7 @@ int main(int argc, char **argv)
 		{ "l1i-event", required_argument, NULL, OPT_L1I },
 		{ "l1d-event", required_argument, NULL, OPT_L1D },
 		{ "l2-event",  required_argument, NULL, OPT_L2 },
+		{ "l3-event",  required_argument, NULL, OPT_L3 },
 		{ "help",      no_argument,       NULL, 'h' },
 		{ "version",   no_argument,       NULL, 'V' },
 		{ NULL, 0, NULL, 0 },
@@ -396,6 +401,7 @@ int main(int argc, char **argv)
 		case OPT_L1I: l1i_spec = optarg; break;
 		case OPT_L1D: l1d_spec = optarg; break;
 		case OPT_L2: l2_spec = optarg; break;
+		case OPT_L3: l3_spec = optarg; break;
 		case 'V':
 			printf("pmutop %s\n", PMUTOP_VERSION);
 			return 0;
@@ -455,7 +461,7 @@ int main(int argc, char **argv)
 
 		for (unsigned k = 0; k < sizeof(rawv) / sizeof(rawv[0]); k++) {
 			if (perf_setup_raw(rawv[k].ev, rawv[k].spec, raw_msg, sizeof(raw_msg)) == 0 ||
-			    raw_msg[0])
+				raw_msg[0])
 				fprintf(stderr, "%s misses: %s\n", rawv[k].what,
 					raw_msg[0] ? raw_msg : "no event configured");
 			for (i = 0; i < o.nr_cpus; i++)
@@ -463,6 +469,18 @@ int main(int argc, char **argv)
 					fprintf(stderr, "cpu%d: no %s-miss event for this core type\n",
 						o.cpus[i], rawv[k].what);
 		}
+
+		/*
+		 * L3 misses: direct event on P-cores, L2 misses minus L3 hits on
+		 * E-cores (perf_read_interval derives it).  Cores with neither,
+		 * e.g. LP E-cores outside the L3, get no L3 data and no message:
+		 * they have no L3 to miss.
+		 */
+		if (perf_setup_raw(EV_L3_MISSES, l3_spec, raw_msg, sizeof(raw_msg)) == 0 &&
+		    raw_msg[0])
+			fprintf(stderr, "L3 misses: %s\n", raw_msg);
+		if (!l3_spec)
+			perf_setup_raw(EV_L3_HITS, NULL, raw_msg, sizeof(raw_msg));
 	}
 
 	if (o.graphic && ui_select(show, err, sizeof(err)) < 0) {
@@ -513,6 +531,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "cannot map %s: %s; continuing without telemetry\n",
 			o.telem, strerror(errno));
 
+	/* Chip-wide counters: uncore clocks and DRAM bandwidth. */
+	if (uncore_open(raw_msg, sizeof(raw_msg)) == 0)
+		fprintf(stderr, "%s\n", raw_msg);
+	uncore_read(&unc, 0);		/* prime the deltas */
+
 	if (o.csv) {
 		csv = fopen(o.csv, "w");
 		if (!csv) {
@@ -520,9 +543,10 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		fprintf(csv, "t_s,cpu,state,util,ipc,llc_mpki,dtlb_mpki,"
-			     "cache_mpki,stall_pct,irq_rate,irq_timer,irq_thermal,"
+			     "l3_mpki,stall_pct,irq_rate,irq_timer,irq_thermal,"
 			     "irq_ipi,irq_device,freq_mhz,temp_c,busy,page_faults,l2_mpki,"
-			     "l1d_mpki,l1i_mpki,itlb_mpki\n");
+			     "l1d_mpki,l1i_mpki,itlb_mpki,uncore_cncu_ghz,uncore_sncu_ghz,"
+			     "dram_read_gbs,dram_write_gbs\n");
 	}
 
 	if (o.graphic) {
@@ -569,6 +593,13 @@ int main(int argc, char **argv)
 		now = now_ns();
 		dt_s = (double)(now - prev_ns) / 1e9;
 		prev_ns = now;
+		uncore_read(&unc, dt_s);
+		if (o.graphic)
+			ui_uncore(&unc);
+		else if (isfinite(unc.cncu_ghz) || isfinite(unc.dram_rd_gbs))
+			printf("uncore: cncu %.2f GHz  sncu %.2f GHz  DRAM read %.2f GB/s"
+			       "  write %.2f GB/s\n", unc.cncu_ghz, unc.sncu_ghz,
+			       unc.dram_rd_gbs, unc.dram_wr_gbs);
 
 		for (i = 0; i < o.nr_cpus; i++) {
 			int64_t ev[EV_NR];
@@ -648,11 +679,11 @@ int main(int argc, char **argv)
 			if (csv)
 				fprintf(csv, "%.3f,%d,%s,%.4f,%.3f,%.3f,%.3f,%.3f,"
 					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f,%lld,%.4f,"
-					"%.4f,%.4f,%.4f\n",
+					"%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f\n",
 					now / 1e9, cs[i].cpu,
 					health_str(met[i].health), met[i].util,
 					met[i].ipc, met[i].llc_mpki, met[i].tlb_mpki,
-					met[i].cache_mpki, met[i].stall_pct,
+					met[i].l3_mpki, met[i].stall_pct,
 					(unsigned long long)cs[i].irq_rate,
 					(unsigned long long)cs[i].irq_timer,
 					(unsigned long long)cs[i].irq_thermal,
@@ -662,7 +693,9 @@ int main(int argc, char **argv)
 					cs[i].ev_ok[EV_PAGE_FAULT] ?
 						(long long)cs[i].ev[EV_PAGE_FAULT] : -1LL,
 					cs[i].l2_mpki, cs[i].l1d_mpki,
-					cs[i].l1i_mpki, cs[i].itlb_mpki);
+					cs[i].l1i_mpki, cs[i].itlb_mpki,
+					unc.cncu_ghz, unc.sncu_ghz,
+					unc.dram_rd_gbs, unc.dram_wr_gbs);
 		}
 
 		if (o.graphic && !ui_paused())
@@ -680,6 +713,7 @@ int main(int argc, char **argv)
 		if (cs[i].perf_ok)
 			perf_close(&pg[i]);
 	telem_close(&tel);
+	uncore_close();
 	if (csv)
 		fclose(csv);
 	return 0;
