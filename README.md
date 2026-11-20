@@ -171,7 +171,9 @@ Each core gets a panel. Within a panel, each metric is a scrolling bar chart sev
 - **▲ grows up, higher is better:** IPC (fixed range 0–5).
 - **■ grows up, neutral:** CPU usage (0–100 %).
 - **▼ hangs down from the top, lower is better:** page faults, L1I, L1D, L2 and L3 misses, iTLB and dTLB misses, and worst frame time when `-t` is used.
-- **Panel header:** state (OK / WARN / FAIL), CPU usage, measured clock, temperature, interrupts per second by source, and the reason when the state is not OK.
+- **Title bar:** time, number of cores, interval, the page when not all cores fit, and the chip-wide [uncore readings](#uncore-chip-wide-clocks-and-memory-bandwidth). On a narrow terminal the uncore readings are shortened, then left out (they are still in the CSV and the text output).
+- **Second line:** a legend for reading the charts, shortened on narrow terminals.
+- **Panel header:** state (OK / WARN / FAIL), CPU usage, measured clock and temperature. The second row starts with the **core type** on hybrid CPUs (`P-core`, `E-core`, `LP E-core`, each in its own colour), then interrupts per second by source. The reason follows when the state is not OK.
 - **Isolated cores** are marked with a magenta `ISOLATED` tag, a magenta core number and heavy magenta dividers.
 - **Event log** (bottom): state changes with time and reason, newest first.
 - **Keys:** `q` quit, `p` pause the display (sampling and learning continue), `c` clear the event log, ← / → or PgUp / PgDn change page.
@@ -219,6 +221,8 @@ With `--batch`, or when the output is not a terminal, pmutop prints one line per
 
 | Column | Meaning |
 |---|---|
+| `cpu` | Core number |
+| `type` | Core type on hybrid CPUs: `P-core`, `E-core` or `LP E-core`; `-` otherwise |
 | `state` | OK, WARN (a signal departed from the core's normal level), FAIL (the real-time task reported a missed deadline) |
 | `cpu%` | CPU usage from the hardware (see [below](#cpu-usage)); Linux's `/proc/stat` figure only when no PMU is available |
 | `MHz` | Average clock while the core was awake, measured |
@@ -231,9 +235,9 @@ With `--batch`, or when the output is not a terminal, pmutop prints one line per
 
 The CSV (`-o`) has one row per core per sample with these columns:
 
-`t_s, cpu, state, util, ipc, llc_mpki, dtlb_mpki, l3_mpki, stall_pct, irq_rate, irq_timer, irq_thermal, irq_ipi, irq_device, freq_mhz, temp_c, busy, page_faults, l2_mpki, l1d_mpki, l1i_mpki, itlb_mpki, uncore_cncu_ghz, uncore_sncu_ghz, dram_read_gbs, dram_write_gbs`
+`t_s, cpu, state, util, ipc, llc_mpki, dtlb_mpki, l3_mpki, stall_pct, irq_rate, irq_timer, irq_thermal, irq_ipi, irq_device, freq_mhz, temp_c, busy, page_faults, l2_mpki, l1d_mpki, l1i_mpki, itlb_mpki, uncore_cncu_ghz, uncore_sncu_ghz, dram_read_gbs, dram_write_gbs, core_type`
 
-`util` is Linux's figure and `busy` the hardware one, both 0–1. The last four columns are chip-wide and repeat on every row of a sample. In text mode they are printed as one `uncore:` line before each sample's core lines. `*_mpki` are misses per 1000 instructions. The `irq_*` class columns are counts per interval, not per second.
+`util` is Linux's figure and `busy` the hardware one, both 0–1. The four `uncore_*` and `dram_*` columns are chip-wide and repeat on every row of a sample; in text mode they are printed as one `uncore:` line before each sample's core lines. `core_type` is as in the text output, and comes last so that the earlier columns keep their positions. `*_mpki` are misses per 1000 instructions. The `irq_*` class columns are counts per interval, not per second.
 
 ## How pmutop measures
 
@@ -291,16 +295,19 @@ Notes:
 - **L1D and L1I count retired instructions.** L1D counts loads that missed L1D; L1I counts instructions fetched after an L1I miss. Prefetches and wrong-path fetches are excluded, so these are the misses that actually affect execution, and P- and E-cores measure the same thing. The generic P-core L1I event (`L2_RQSTS.ALL_CODE_RD`) counts every code request sent to L2, including prefetches. That read 5–8× the real misses and was not used.
 - **L2 differs slightly between core types.** On P-cores the event counts demand data-read requests that missed L2, on E-cores retired loads that missed L2. Compare P- and E-core L2 numbers with care.
 - **LP E-cores** have no event table in perf; they share the E-core design, and the E-core codes are used.
+- **Core type.** pmutop takes each core's type from the per-type PMUs' `cpus` lists in sysfs (`cpu_core`, `cpu_atom`, `cpu_lowpower`): the same mapping that selects its event codes, so the label always matches the counters in use. A non-hybrid CPU has a single `cpu` PMU, and no type is shown.
 - **L3 misses** count loads served from DRAM. E-cores have no event for that, so pmutop counts their L2 misses and L3 hits and subtracts, using one extra counter instead of two. The LP E-cores are outside the L3, so they have no L3 chart data.
 - **Other CPUs.** Give the codes with `--l2-event`, `--l1d-event` and `--l1i-event`, one `PMU:config[:config1]` per core type, for example `--l1i-event cpu_core:0x03c6:0x12,cpu_atom:0x20c6`. See [Adding event codes for your CPU](#adding-event-codes-for-your-cpu). A core whose type has no code shows no data for that chart; everything else still works.
 
 ### Uncore: chip-wide clocks and memory bandwidth
 
-Besides the per-core counters, pmutop reads a few chip-wide ("uncore") counters once per interval and shows them on the second line of the full-screen view, for example:
+Besides the per-core counters, pmutop reads a few chip-wide ("uncore") counters once per interval and shows them on the title bar of the full-screen view, for example:
 
 ```
- uncore:  cncu 2.15 GHz  sncu 1.06 GHz   DRAM read 0.08 GB/s  write 0.10 GB/s
+ pmutop  03:50:58  2 core(s)  every 500 ms  uncore: cncu 0.60 GHz  sncu 0.97 GHz   DRAM read 0.01  write 0.00 GB/s    q quit  p pause  c clear
 ```
+
+On a narrower terminal they are shortened (`DRAM r 0.1 w 0.0 GB/s`). Below about 130 columns they are left out of the screen, but still recorded in the CSV and printed in the text output.
 
 | Value | Source | Meaning |
 |---|---|---|

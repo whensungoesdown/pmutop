@@ -62,6 +62,7 @@ const char *perf_event_name(int ev);
 double perf_ref_hz(void);
 int  perf_setup_raw(int ev, const char *spec, char *msg, size_t msglen);
 bool perf_raw_covers(int ev, int cpu);
+const char *perf_core_type(int cpu);	/* "P-core", "E-core", ... or NULL */
 int  perf_open(struct perf_group *g, int cpu, pid_t pid, char *err, size_t errlen);
 void perf_close(struct perf_group *g);
 int  perf_read_interval(struct perf_group *g, int64_t out[EV_NR], bool ok[EV_NR],

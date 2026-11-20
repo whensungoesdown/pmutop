@@ -680,6 +680,16 @@ static void draw_chart(const struct slot_hist *h, int g, int r, int c, int w, in
 	}
 }
 
+/* One colour per core type, so P-, E- and LP E-core panels are told apart. */
+static unsigned char type_col(const char *type)
+{
+	if (strcmp(type, "P-core") == 0)
+		return C_DEF;
+	if (strcmp(type, "E-core") == 0)
+		return C_CYAN;
+	return C_BLUE;		/* LP E-core */
+}
+
 /* Charts to show, in order; set by ui_select() (--show). */
 static const struct { const char *key; int g; } chart_keys[] = {
 	{ "frame", G_FRAME }, { "cpu", G_BUSY }, { "ipc", G_IPC }, { "pf", G_PF },
@@ -766,10 +776,20 @@ static void draw_panel(const struct slot_hist *h, int r0, int c0, int w, int ph)
 	put_textf(r0, c0 + 15, w - 15, C_DEF, "CPU %s  %.0f MHz  %s",
 		  b, m->freq_mhz, t);
 	w += tagw;		/* full width again below the tag */
-	put_textf(r0 + 1, c0, w, C_DIM,
-		  "IRQ/s: timer %.0f  thermal %.0f  IPI %.0f  device %.0f",
-		  s->irq_timer * rate, s->irq_thermal * rate,
-		  s->irq_ipi * rate, s->irq_device * rate);
+	{
+		/* core type first on the second row, on hybrid CPUs */
+		const char *type = perf_core_type(h->cpu);
+		int tw = 0;
+
+		if (type) {
+			tw = (int)strlen(type) + 2;
+			put_text(r0 + 1, c0, tw, type, A_BOLD | type_col(type));
+		}
+		put_textf(r0 + 1, c0 + tw, w - tw, C_DIM,
+			  "IRQ/s: timer %.0f  thermal %.0f  IPI %.0f  device %.0f",
+			  s->irq_timer * rate, s->irq_thermal * rate,
+			  s->irq_ipi * rate, s->irq_device * rate);
+	}
 	if (m->why[0])
 		put_text(r0 + 2, c0, w, m->why, state_col(m->health));
 
@@ -878,32 +898,65 @@ void ui_draw(int nslots)
 		const char *keys = pages > 1 ? " q quit  p pause  c clear  \xe2\x86\x90\xe2\x86\x92 page "
 					     : " q quit  p pause  c clear ";
 		int kw = pages > 1 ? 37 : 26;
-
-		if (cols > (int)strlen(title) + kw)
-			put_text(0, cols - kw, kw, keys, A_REV);
-	}
-	/*
-	 * Second row: chip-wide uncore readings when there are any, else a
-	 * reminder of how to read the charts.
-	 */
-	if (isfinite(unc.cncu_ghz) || isfinite(unc.dram_rd_gbs)) {
+		int tw = (int)strlen(title);
 		char ul[200];
 		int n = 0;
 
-		n += snprintf(ul + n, sizeof(ul) - n, " uncore:");
-		if (isfinite(unc.cncu_ghz))
-			n += snprintf(ul + n, sizeof(ul) - n, "  cncu %.2f GHz", unc.cncu_ghz);
-		if (isfinite(unc.sncu_ghz))
-			n += snprintf(ul + n, sizeof(ul) - n, "  sncu %.2f GHz", unc.sncu_ghz);
-		if (isfinite(unc.dram_rd_gbs))
-			snprintf(ul + n, sizeof(ul) - n, "   DRAM read %.2f GB/s  write %.2f GB/s",
-				 unc.dram_rd_gbs, unc.dram_wr_gbs);
-		put_text(1, 0, cols, ul, C_CYAN | A_BOLD);
-	} else {
-		put_text(1, 0, cols,
-			 " \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
-			 "   bar colour = range it was drawn on: green < light blue < blue < magenta;"
-			 " yellow/red = high/too high", C_DIM);
+		if (cols > tw + kw)
+			put_text(0, cols - kw, kw, keys, A_REV);
+		else
+			kw = 0;
+
+		/*
+		 * Chip-wide uncore readings on the title bar, between the title
+		 * and the key help; shortened, then dropped, when it is narrow.
+		 */
+		if (isfinite(unc.cncu_ghz) || isfinite(unc.dram_rd_gbs)) {
+			bool full;
+
+			for (int pass = 0; pass < 2; pass++) {
+				full = pass == 0;
+				n = snprintf(ul, sizeof(ul), "  uncore:");
+				if (isfinite(unc.cncu_ghz))
+					n += snprintf(ul + n, sizeof(ul) - n, " cncu %.2f GHz", unc.cncu_ghz);
+				if (isfinite(unc.sncu_ghz))
+					n += snprintf(ul + n, sizeof(ul) - n, "  sncu %.2f GHz", unc.sncu_ghz);
+				if (isfinite(unc.dram_rd_gbs))
+					n += snprintf(ul + n, sizeof(ul) - n,
+						      full ? "   DRAM read %.2f  write %.2f GB/s"
+							   : "  DRAM r %.1f w %.1f GB/s",
+						      unc.dram_rd_gbs, unc.dram_wr_gbs);
+				if (tw + n + kw + 1 <= cols)
+					break;
+				n = 0;
+			}
+			if (n)
+				put_text(0, tw, n, ul, A_REV | C_CYAN | A_BOLD);
+		}
+	}
+	{
+		/* the legend, shortened on narrow terminals rather than cut off */
+		static const char *const legend[] = {
+			" \xe2\x96\xb2 grows up: higher is better   \xe2\x96\xbc hangs down: lower is better"
+			"   bar colour = range it was drawn on: green < light blue < blue < magenta;"
+			" yellow/red = high/too high",
+			" \xe2\x96\xb2 higher is better  \xe2\x96\xbc lower is better"
+			"  colour = range: green < lt blue < blue < magenta; yellow/red = high/too high",
+			" \xe2\x96\xb2 higher better  \xe2\x96\xbc lower better"
+			"  range: grn<lt blu<blu<mag  yel/red: high",
+		};
+		int k;
+
+		/* width in cells: every multi-byte character is one cell here */
+		for (k = 0; k < 2; k++) {
+			int w = 0;
+
+			for (const char *c = legend[k]; *c; c++)
+				w += ((unsigned char)*c & 0xc0) != 0x80;
+			if (w <= cols)
+				break;
+		}
+		put_text(1, 0, cols, legend[k], C_DIM);
 	}
 
 	for (i = first; i < last; i++) {

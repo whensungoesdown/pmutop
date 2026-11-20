@@ -282,10 +282,18 @@ static const char *health_str(enum cpu_health h)
 	return "?";
 }
 
+/* "P-core", "E-core", "LP E-core"; "-" on a non-hybrid CPU. */
+static const char *core_type(int cpu)
+{
+	const char *t = perf_core_type(cpu);
+
+	return t ? t : "-";
+}
+
 static void print_header(void)
 {
-	printf("%-4s %-5s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
-	       "cpu", "state", "cpu%", "MHz", "IPC", "LLC/K", "dTLB/K",
+	printf("%-4s %-9s %-5s %6s %7s %7s %8s %8s %8s %7s %8s %6s  %s\n",
+	       "cpu", "type", "state", "cpu%", "MHz", "IPC", "LLC/K", "dTLB/K",
 	       "L3/K", "stall%", "IRQ/s", "temp", "note");
 }
 
@@ -314,8 +322,8 @@ static void print_row(const struct cpu_sample *s, const struct metrics *m)
 	fmt_or_dash(busy, sizeof(busy),
 		    (isfinite(m->busy) ? m->busy : m->util) * 100.0, "%.1f");
 
-	printf("%-4d %-5s %6s %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
-	       s->cpu, health_str(m->health), busy, m->freq_mhz,
+	printf("%-4d %-9s %-5s %6s %7.0f %7s %8s %8s %8s %7s %8llu %6s  %s\n",
+	       s->cpu, core_type(s->cpu), health_str(m->health), busy, m->freq_mhz,
 	       ipc, llc, tlb, l3, stall,
 	       (unsigned long long)s->irq_rate, tmp, m->why);
 }
@@ -546,7 +554,7 @@ int main(int argc, char **argv)
 			     "l3_mpki,stall_pct,irq_rate,irq_timer,irq_thermal,"
 			     "irq_ipi,irq_device,freq_mhz,temp_c,busy,page_faults,l2_mpki,"
 			     "l1d_mpki,l1i_mpki,itlb_mpki,uncore_cncu_ghz,uncore_sncu_ghz,"
-			     "dram_read_gbs,dram_write_gbs\n");
+			     "dram_read_gbs,dram_write_gbs,core_type\n");
 	}
 
 	if (o.graphic) {
@@ -679,7 +687,7 @@ int main(int argc, char **argv)
 			if (csv)
 				fprintf(csv, "%.3f,%d,%s,%.4f,%.3f,%.3f,%.3f,%.3f,"
 					"%.3f,%llu,%llu,%llu,%llu,%llu,%.0f,%.1f,%.4f,%lld,%.4f,"
-					"%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f\n",
+					"%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%s\n",
 					now / 1e9, cs[i].cpu,
 					health_str(met[i].health), met[i].util,
 					met[i].ipc, met[i].llc_mpki, met[i].tlb_mpki,
@@ -695,7 +703,8 @@ int main(int argc, char **argv)
 					cs[i].l2_mpki, cs[i].l1d_mpki,
 					cs[i].l1i_mpki, cs[i].itlb_mpki,
 					unc.cncu_ghz, unc.sncu_ghz,
-					unc.dram_rd_gbs, unc.dram_wr_gbs);
+					unc.dram_rd_gbs, unc.dram_wr_gbs,
+					core_type(cs[i].cpu));
 		}
 
 		if (o.graphic && !ui_paused())

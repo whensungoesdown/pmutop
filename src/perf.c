@@ -291,6 +291,30 @@ static const struct raw_pmu *raw_for_cpu(int ev, int cpu)
 	return NULL;
 }
 
+/*
+ * Core type of @cpu on a hybrid CPU, from the per-type PMUs' "cpus"
+ * lists.  NULL on a non-hybrid machine (a single "cpu" PMU), where there
+ * is nothing to tell apart.  On Intel the names are cpu_core (P-core),
+ * cpu_atom (E-core) and cpu_lowpower (LP E-core).
+ */
+const char *perf_core_type(int cpu)
+{
+	static const struct { const char *pmu, *label; } types[] = {
+		{ "cpu_core", "P-core" },
+		{ "cpu_atom", "E-core" },
+		{ "cpu_lowpower", "LP E-core" },
+	};
+	char path[128], buf[256];
+
+	for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+		snprintf(path, sizeof(path),
+			 "/sys/bus/event_source/devices/%s/cpus", types[i].pmu);
+		if (read_line(path, buf, sizeof(buf)) == 0 && cpu_in_list(buf, cpu))
+			return types[i].label;
+	}
+	return NULL;
+}
+
 bool perf_raw_covers(int ev, int cpu)
 {
 	return raw_for_cpu(ev, cpu) != NULL;
